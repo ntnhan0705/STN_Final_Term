@@ -1,0 +1,16 @@
+# datasets/xray_data.yaml
+# -------------------------------------------------
+# Dataset config for chest-X-ray 14 labels
+# -------------------------------------------------
+train: C:/OneDrive/Study/AI/STN_Final_Term/datasets/train
+val:   C:/OneDrive/Study/AI/STN_Final_Term/datasets/valid
+
+# number of classes
+nc: 14
+
+# class names
+names: [
+  "Phinh dong mach chu", "Xep phoi", "Voi hoa", "Tim to", "Dong dac",
+  "Benh phoi ke (ILD)", "Tham nhiem", "Mo phoi", "Not/Khoi", "Ton thuong khac",
+  "Tran dich mang phoi", "Day mang phoi", "Tran khi mang phoi", "Xo hoa phoi"
+]
