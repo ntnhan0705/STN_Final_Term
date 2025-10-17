@@ -34,3 +34,11 @@ images/
 labels/
 *.zip
 *.tar*
+# Generated visuals & banks
+scripts/bank_out/
+scripts/bank_vis/
+scripts/bgpair_vis/
+scripts/*.json
+
+# Sample assets from libs
+ultralytics/assets/
