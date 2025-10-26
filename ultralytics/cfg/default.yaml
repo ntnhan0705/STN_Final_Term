@@ -30,7 +30,7 @@ deterministic: False # (bool) whether to enable deterministic mode
 single_cls: False # (bool) train multi-class data as single-class
 rect: False # (bool) rectangular training if mode='train' or rectangular validation if mode='val'
 cos_lr: False # (bool) use cosine learning rate scheduler
-close_mosaic: 20 # (int) disable mosaic augmentation for final epochs (0 to disable)
+close_mosaic: 50 # (int) disable mosaic augmentation for final epochs (0 to disable)
 resume: False # (bool) resume training from last checkpoint
 amp: True # (bool) Automatic Mixed Precision (AMP) training, choices=[True, False], True runs AMP check
 fraction: 1.00 # (float) dataset fraction to train on (default is 1.0, all images in train set)
@@ -48,7 +48,7 @@ val: True # (bool) validate/test during training
 split: val # (str) dataset split to use for validation, i.e. 'val', 'test' or 'train'
 save_json: False # (bool) save results to JSON file
 conf: 0.001 # (float, optional) object confidence threshold for detection (default 0.25 predict, 0.001 val)
-iou: 0.10 # (float) intersection over union (IoU) threshold for NMS
+iou: 0.1 # (float) intersection over union (IoU) threshold for NMS
 max_det: 2000 # (int) maximum number of detections per image
 half: False # (bool) use half precision (FP16)
 dnn: False # (bool) use OpenCV DNN for ONNX inference
@@ -89,7 +89,7 @@ nms: False # (bool) CoreML: add NMS
 
 # Hyperparameters ------------------------------------------------------------------------------------------------------
 lr0: 0.001 # (float) initial learning rate (i.e. SGD=1E-2, Adam=1E-3)
-lrf: 0.0001 # (float) final learning rate (lr0 * lrf)
+lrf: 0.001 # (float) final learning rate (lr0 * lrf)
 momentum: 0.937 # (float) SGD momentum/Adam beta1
 weight_decay: 0.0005 # (float) optimizer weight decay 5e-4
 warmup_epochs: 10 # (float) warmup epochs (fractions ok)
@@ -109,8 +109,8 @@ translate: 0.0 # (float) image translation (+/- fraction)
 scale: 0.10 # (float) image scale (+/- gain)
 shear: 0.10 # (float) image shear (+/- deg)
 perspective: 0.0 # (float) image perspective (+/- fraction), range 0-0.001
-flipud: 0.25 # (float) image flip up-down (probability)
-fliplr: 0.05 # (float) image flip left-right (probability)
+flipud: 0.00 # (float) image flip up-down (probability)
+fliplr: 0.00 # (float) image flip left-right (probability)
 bgr: 0.0 # (float) image channel BGR (probability)
 mosaic: 1.00 # (float) image mosaic (probability)
 mixup: 0.5 # (float) image mixup (probability)
