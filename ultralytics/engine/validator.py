@@ -219,6 +219,15 @@ class BaseValidator:
                     self.loss += model.loss(batch, preds)[1]
 
             # Postprocess
+            try:
+                if isinstance(preds, torch.Tensor):
+                    LOGGER.info(f"[Validator DEBUG] Raw preds before NMS - shape: {preds.shape}, "
+                                f"max score: {preds[..., 4:].sigmoid().max():.4f}, "
+                                f"num > 0.01: {(preds[..., 4:].sigmoid() > 0.01).sum()}")
+                else:
+                    LOGGER.info(f"[Validator DEBUG] Raw preds type before NMS: {type(preds)}")
+            except Exception as e:
+                LOGGER.warning(f"[Validator DEBUG] Error logging raw preds: {e}")
             with dt[3]:
                 preds = self.postprocess(preds)
 

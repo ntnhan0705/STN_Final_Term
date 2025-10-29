@@ -257,10 +257,19 @@ class PublishThetaToStateV2(_Ctx):
             if m in st: continue
             prev = getattr(m, "record_theta", None); st[m] = prev
             def rec(theta, _prev=prev):
-                try: _prev and _prev(theta)
-                except Exception: pass
-                try: S["stn_theta"] = theta.detach() if hasattr(theta, "detach") else theta
-                except Exception: S["stn_theta"] = theta
+                try:
+                    _prev and _prev(theta)
+                except Exception:
+                    pass
+                try:
+                    # <<< THÊM LOG DEBUG >>>
+                    theta_shape = theta.shape if hasattr(theta, "shape") else "N/A"
+                    LOGGER.info(f"[PublishTheta DEBUG] Callback received theta with shape: {theta_shape}")
+                    # <<< KẾT THÚC LOG DEBUG >>>
+                    S["stn_theta"] = theta.detach() if hasattr(theta, "detach") else theta
+                except Exception as e:  # Thêm exception handling cụ thể hơn
+                    LOGGER.error(f"[PublishTheta DEBUG] Failed to set stn_theta in state: {e}")
+                    S["stn_theta"] = theta  # Vẫn thử gán nếu detach lỗi
             setattr(m, "record_theta", rec); cnt += 1
         if self.verbose: LOGGER.info(f"[ThetaPub] attach[{slot}] -> {cnt}")
         return cnt

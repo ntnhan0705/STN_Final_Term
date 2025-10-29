@@ -4,6 +4,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ultralytics.utils import LOGGER
+
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
@@ -160,6 +162,18 @@ class SpatialTransformer(nn.Module):
         # >>> THÊM 2 DÒNG NÀY <<<
         self._stn_last_out = warped.detach()  # để loss đọc lại cho ROIAlign
         self.theta = theta.detach()  # phòng khi loss muốn warp GT
+        # <<< THÊM LOG DEBUG >>>
+        try:
+            if self.enabled and c >= self.c_in:
+                LOGGER.info(f"[STN DEBUG] Calculated theta shape: {theta.shape}, "
+                            f"mean: {theta.mean():.4f}, is_identity: {torch.allclose(theta, self._identity_theta(B, x.device, theta.dtype), atol=1e-4)}")
+            else:
+                LOGGER.info(
+                    f"[STN DEBUG] Forward bypassed (enabled={self.enabled}, c={c} < c_in={self.c_in}). Theta should be identity.")
+        except Exception as e:
+            LOGGER.warning(f"[STN DEBUG] Error logging theta: {e}")
+        # <<< KẾT THÚC LOG DEBUG >>>
+
         if self.record_theta:
             self.record_theta(self.theta)
 

@@ -256,24 +256,37 @@ class DetectSDTN(Detect):
         x: list feature P3, P4, P5.
         Nếu self.active=False ➜ bỏ qua de-warp.
         """
-        if not hasattr(self, "_log_once"):
-            try:
-                xs = []
-                for xi in (x if isinstance(x, (list, tuple)) else [x]):
-                    try:
-                        xs.append(tuple(xi.shape))
-                    except Exception:
-                        xs.append(type(xi).__name__)
-                LOGGER.info(f"[DetectSDTN] forward() in-shapes={xs}")
-            except Exception:
-                pass
-            self._log_once = True
-
+        # <<< THÊM LOG DEBUG >>>
+        theta_from_stn = None
+        stn_found = False
+        try:
+            self._lazy_find_stn()  # Đảm bảo _stn được khởi tạo
+            if self._stn and hasattr(self._stn, 'theta') and self._stn.theta is not None:
+                theta_from_stn = self._stn.theta
+                stn_found = True
+            is_active = self.active and isinstance(x, (list, tuple))
+            theta_shape = theta_from_stn.shape if theta_from_stn is not None else "None"
+            LOGGER.info(f"[DetectSDTN DEBUG] active={is_active}, stn_found={stn_found}, theta shape: {theta_shape}")
+        except Exception as e:
+            LOGGER.warning(f"[DetectSDTN DEBUG] Error checking theta: {e}")
+        # <<< KẾT THÚC LOG DEBUG >>>
         if self.active and isinstance(x, (list, tuple)):
-            self._lazy_find_stn()
+            # self._lazy_find_stn() # Đã gọi ở trên
             if self._stn and self._stn.theta is not None:
-                theta_inv = _invert_affine(self._stn.theta)
-                x = self._dewarp_feats(x, theta_inv)
+                try:  # Thêm try-except để bắt lỗi invert/dewarp
+                    theta_inv = _invert_affine(self._stn.theta)
+                    x_dewarped = self._dewarp_feats(x, theta_inv)
+                    # <<< THÊM LOG DEBUG >>>
+                    feat_shapes_before = [f.shape for f in x]
+                    feat_shapes_after = [f.shape for f in x_dewarped]
+                    LOGGER.info(
+                        f"[DetectSDTN DEBUG] De-warped features. Before: {feat_shapes_before}, After: {feat_shapes_after}")
+                    # <<< KẾT THÚC LOG DEBUG >>>
+                    x = x_dewarped
+                except Exception as e:
+                    LOGGER.error(f"[DetectSDTN DEBUG] Error during de-warping: {e}. Using original features.")
+            else:
+                LOGGER.warning("[DetectSDTN DEBUG] STN found but theta is None. Skipping de-warp.")
 
         # gọi Detect.forward (original) để tính logits / loss
         return super().forward(x)
