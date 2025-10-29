@@ -241,7 +241,7 @@ def train_one(args: argparse.Namespace, run_id: int):
     yolo.add_callback("on_val_start", SeedIdentityThetaOnValStart(B_hint=int(args.batch)).on_val_start)
 
     # VAL: chỉ ép identity trong N epoch đầu để không “vỡ” mAP sớm
-    _val_id = ValIdentityWindow(ctrl, until_epoch=5)
+    _val_id = ValIdentityWindow(ctrl, until_epoch=0)
     yolo.add_callback("on_val_start", _val_id.on_val_start)
     yolo.add_callback("on_val_end",   _val_id.on_val_end)
 
@@ -363,7 +363,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=100, help="Early-stopping patience.")
 
     # STN
-    p.add_argument("--freeze_epochs", type=int, default=10, help="Freeze/disable STN for first N epochs.")
+    p.add_argument("--freeze_epochs", type=int, default=0, help="Freeze/disable STN for first N epochs.")
     p.add_argument("--debug_images", action="store_true", help="Dump STN debug images.")
     p.add_argument("--tsne_every", type=int, default=0, help="Export t-SNE every N epochs (0 to disable).")
     p.add_argument("--tsne_per_class", type=int, default=300, help="Max samples per class for t-SNE.")
@@ -385,7 +385,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--supcon_use_mem", type=int, default=1)
     p.add_argument("--supcon_queue", type=int, default=4096)
     p.add_argument("--supcon_loss_weight", type=float, default=None)
-    p.add_argument("--supcon_schedule", type=str, default="5-")  # bật SupCon từ epoch 5
+    p.add_argument("--supcon_schedule", type=str, default="0-")  # bật SupCon từ epoch 5
     p.add_argument("--supcon_proj_dim", type=int, default=128)
     p.add_argument("--supcon_proj_hidden", type=int, default=512)
     p.add_argument("--supcon_proj_bn", type=int, default=2, choices=[0, 1, 2])
@@ -408,7 +408,7 @@ def parse_args() -> argparse.Namespace:
         args.save = 1
         args.save_period = -1
         args.amp = 1
-        args.freeze_epochs = 3
+        args.freeze_epochs = 0
         return args
 
     # Normal CLI
