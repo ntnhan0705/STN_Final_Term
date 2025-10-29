@@ -91,117 +91,150 @@ class STNControl(_Ctx):
         self.tmax, self.smin, self.smax = float(tmax), float(smin), float(smax)
         self.log = bool(log)
         self._mode, self._alpha = "identity", 0.0
+        self._epoch = -1  # chỉ để log nếu cần
 
     def _alpha_for(self, e: int) -> float:
-        if e < self.freeze_epochs: return 0.0
-        if self.stn_warmup <= 0:   return 1.0
+        if e < self.freeze_epochs:
+            return 0.0
+        if self.stn_warmup <= 0:
+            return 1.0
         k = (e - self.freeze_epochs) / float(self.stn_warmup)
         return float(max(0.0, min(1.0, k)))
 
     @staticmethod
     def _ensure_orig_forward(m):
-        if not hasattr(m, "_stn_forward_orig"): m._stn_forward_orig = m.forward
+        if not hasattr(m, "_stn_forward_orig"):
+            m._stn_forward_orig = m.forward
 
     def _patch_identity(self, m):
         self._ensure_orig_forward(m)
+
         def f(x, *_, **__):
             B = x.shape[0]
-            theta_I = x.new_tensor([[1,0,0],[0,1,0]]).unsqueeze(0).repeat(B,1,1)
-            if hasattr(m, "record_theta"):
-                try: m.record_theta(theta_I)
-                except Exception: pass
-            return x
-        m.forward = f; m._stn_mode = "identity"
-
-    def _patch_blend(self, m, alpha: float):
-        self._ensure_orig_forward(m)
-        tmax, smin, smax = self.tmax, self.smin, self.smax
-        alpha = float(max(0.0, min(1.0, alpha)))
-        LOGGER.info(f"[STNDbg] epoch={getattr(trainer, 'epoch', -1) if 'trainer' in globals() else 'NA'} "
-                    f"alpha={float(alpha):.3f} (0=off→1=full)")
-
-        def f(x, *a, **kw):
-            out = m._stn_forward_orig(x, *a, **kw)
-            if isinstance(out, (tuple, list)) and len(out) >= 2: x_t, theta = out[0], out[1]
-            try:
-                with torch.no_grad():
-                    # đo xem có “gần identity” không (chuẩn L1)
-                    ident = torch.tensor([[[1, 0, 0], [0, 1, 0]]], dtype=theta.dtype, device=theta.device).expand(
-                        theta.size(0), -1, -1)
-                    l1 = (theta - ident).abs().mean().item()
-                LOGGER.info(f"[STNDbg] theta_raw_l1_to_I={l1:.4e}")
-            except Exception:
-                LOGGER.info("[STNDbg] theta_raw not available")
-            else: x_t, theta = (out if torch.is_tensor(out) else x), None
-            if not torch.is_tensor(theta):
-                if hasattr(m, "record_theta"):
-                    try:
-                        m.record_theta(x.new_tensor([[1, 0, 0], [0, 1, 0]]).unsqueeze(0).repeat(x.size(0), 1, 1))
-                    except Exception:
-                        pass
-                LOGGER.info("[STN] STN forward: no theta output, using identity transform.")
-                return x if alpha < 1.0 else x_t
-            B, C, H, W = x.shape
-            T = theta.view(-1, 2, 3).to(dtype=x.dtype)
-            M, t = T[:, :, :2], T[:, :, 2].tanh() * tmax
-            try:
-                U, S, Vh = torch.linalg.svd(M); S = S.clamp(smin, smax); M = U @ torch.diag_embed(S) @ Vh
-            except Exception:
-                I = torch.eye(2, device=x.device, dtype=x.dtype).unsqueeze(0); M = 0.75 * (M - I) + I
-            theta_safe = torch.cat([M, t.unsqueeze(-1)], -1)
-            try:
-                with torch.no_grad():
-                    ident = torch.tensor([[[1, 0, 0], [0, 1, 0]]], dtype=theta_safe.dtype,
-                                         device=theta_safe.device).expand(theta_safe.size(0), -1, -1)
-                    l1s = (theta_safe - ident).abs().mean().item()
-                LOGGER.info(f"[STNDbg] theta_safe_l1_to_I={l1s:.4e}  (clamped)")
-            except Exception:
-                pass
-
-            grid = F.affine_grid(theta_safe, size=(B, C, H, W), align_corners=False)
-            x_stab = F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-            LOGGER.info(f"[STN] theta_safe = {theta_safe.detach().cpu().numpy()}")
+            theta_I = x.new_tensor([[1, 0, 0], [0, 1, 0]]).unsqueeze(0).repeat(B, 1, 1)
             if hasattr(m, "record_theta"):
                 try:
-                    m.record_theta(theta_safe)
+                    m.record_theta(theta_I)
                 except Exception:
                     pass
-            return x_stab if alpha >= 1.0 else (x + (x_stab - x) * alpha)
-        m.forward = f; m._stn_mode = "blend"
+            return x
+
+        m.forward = f
+        m._stn_mode = "identity"
+
+    def _patch_blend(self, m, alpha: float):
+        """Blend output with strength alpha. If theta exists, clamp (t, s) -> stabilized grid_sample."""
+        self._ensure_orig_forward(m)
+        # chốt alpha cho closure (không phụ thuộc biến ngoài)
+        alpha = float(max(0.0, min(1.0, alpha)))
+        tmax, smin, smax = self.tmax, self.smin, self.smax
+
+        def f(x, *a, **kw):
+            from torch.nn import functional as F  # tránh yêu cầu import ở đầu file
+            out = m._stn_forward_orig(x, *a, **kw)
+
+            # 1) Unpack out -> (x_t, theta) nếu có
+            x_t, theta = None, None
+            if isinstance(out, (tuple, list)):
+                if len(out) >= 2:
+                    x_t, theta = out[0], out[1]
+                elif len(out) == 1 and torch.is_tensor(out[0]):
+                    x_t = out[0]
+            elif torch.is_tensor(out):
+                x_t = out
+
+            # 2) Nếu có theta, kẹp để lấy x_stab
+            if theta is not None and torch.is_tensor(theta):
+                try:
+                    B, C, H, W = x.shape
+                    T = theta.view(-1, 2, 3).to(dtype=x.dtype, device=x.device)
+                    M, t = T[:, :, :2], T[:, :, 2].tanh() * tmax
+                    try:
+                        U, S, Vh = torch.linalg.svd(M)
+                        S = S.clamp(smin, smax)
+                        M = U @ torch.diag_embed(S) @ Vh
+                    except Exception:
+                        I = torch.eye(2, device=x.device, dtype=x.dtype).unsqueeze(0)
+                        M = 0.75 * (M - I) + I
+                    theta_safe = torch.cat([M, t.unsqueeze(-1)], -1)
+
+                    grid = F.affine_grid(theta_safe, size=(B, C, H, W), align_corners=False)
+                    x_stab = F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+                    if hasattr(m, "record_theta"):
+                        try:
+                            m.record_theta(theta_safe)
+                        except Exception:
+                            pass
+                    x_t = x_stab  # dùng bản ổn định để blend
+                except Exception:
+                    # nếu có lỗi khi clamp, cứ dùng x_t (nếu đã có) hoặc fallback ở bước 3
+                    pass
+
+            # 3) Đảm bảo luôn có x_t (fallback identity)
+            if x_t is None:
+                x_t = x
+                try:
+                    LOGGER.info("[STN] STN forward: no theta output, using identity transform.")
+                except Exception:
+                    pass
+
+            # 4) Trả về theo alpha (blend an toàn)
+            if alpha <= 0.0:
+                return x
+            if alpha >= 1.0:
+                return x_t
+            return x.lerp(x_t, alpha)
+
+        m.forward = f
+        m._stn_mode = "blend"
 
     def _apply_identity(self, model, on: bool):
         for m in self.stn_modules(model):
-            if on: self._patch_identity(m)
-            elif getattr(m, "_stn_forward_orig", None): m.forward = m._stn_forward_orig
+            if on:
+                self._patch_identity(m)
+            elif getattr(m, "_stn_forward_orig", None):
+                m.forward = m._stn_forward_orig
 
     def _apply_blend(self, model, alpha: float):
-        for m in self.stn_modules(model): self._patch_blend(m, alpha)
+        for m in self.stn_modules(model):
+            self._patch_blend(m, alpha)
 
     # Ultralytics callbacks
     def on_train_epoch_start(self, trainer):
         model = self.root(trainer)
-        if model is None: return
+        if model is None:
+            return
         e = int(getattr(trainer, "epoch", 0))
+        self._epoch = e
         if e < self.freeze_epochs:
-            self._apply_identity(model, True); self._mode, self._alpha = "identity", 0.0
-            if self.log: LOGGER.info(f"[STN] identity @ epoch {e}")
+            self._apply_identity(model, True)
+            self._mode, self._alpha = "identity", 0.0
+            if self.log:
+                LOGGER.info(f"[STN] identity @ epoch {e}")
         else:
             a = self._alpha_for(e)
-            self._apply_identity(model, False); self._apply_blend(model, a)
+            self._apply_identity(model, False)
+            self._apply_blend(model, a)
             self._mode, self._alpha = "blend", a
-            if self.log: LOGGER.info(f"[STN] blend α={a:.3f} (t≤{self.tmax:.2f}, s∈[{self.smin:.2f},{self.smax:.2f}])")
+            if self.log:
+                LOGGER.info(f"[STN] blend α={a:.3f} (t≤{self.tmax:.2f}, s∈[{self.smin:.2f},{self.smax:.2f}])")
 
     def on_val_start(self, validator):
         m = self.root(validator)
-        if m is not None: self._apply_identity(m, True)
-        if self.log: LOGGER.info("[STN] validation: identity")
+        if m is not None:
+            self._apply_identity(m, True)
+        if self.log:
+            LOGGER.info("[STN] validation: identity")
 
     def on_val_end(self, validator):
         m = self.root(validator)
-        if m is None: return
+        if m is None:
+            return
         if self._mode == "blend":
-            self._apply_identity(m, False); self._apply_blend(m, self._alpha)
-            if self.log: LOGGER.info(f"[STN] restore blend α={self._alpha:.3f}")
+            self._apply_identity(m, False)
+            self._apply_blend(m, self._alpha)
+            if self.log:
+                LOGGER.info(f"[STN] restore blend α={self._alpha:.3f}")
 
 class ForceSTNIdentityOnVal:  # BC wrapper
     def __init__(self, log=False): self.ctrl = STNControl(log=log)
@@ -419,8 +452,14 @@ class DebugImages(_Ctx):
                 if not isinstance(t, torch.Tensor) or t.numel()==0:
                     t = torch.tensor([[1,0,0],[0,1,0]], dtype=torch.float32)
                 t = t.detach().cpu().view(2,3).numpy()
-                Rd = self.put_text(Rd, f"θ0: {t[0,0]:+0.3f} {t[0,1]:+0.3f} {t[0,2]:+0.3f}", (10,60), (120,255,120), 28)
-                Rd = self.put_text(Rd, f"θ1: {t[1,0]:+0.3f} {t[1,1]:+0.3f} {t[1,2]:+0.3f}", (10,94), (120,255,120), 28)
+                Rd = self.put_text(Rd, f"θ0: {t[0, 0]:+0.5f} {t[0, 1]:+0.5f} {t[0, 2]:+0.5f}", (10, 60),
+                                   (120, 255, 120), 28)
+                Rd = self.put_text(Rd, f"θ1: {t[1, 0]:+0.5f} {t[1, 1]:+0.5f} {t[1, 2]:+0.5f}", (10, 94),
+                                   (120, 255, 120), 28)
+                dx = float(t[0, 2]) * (Ws / 2.0)  # ~ pixel theo chiều ngang
+                dy = float(t[1, 2]) * (Hs / 2.0)  # ~ pixel theo chiều dọc
+                Rd = self.put_text(Rd, f"Δt ≈ ({dx:+.2f}px, {dy:+.2f}px)", (10, 128), (180, 220, 255), 26)
+
                 both = np.concatenate([Ld,Rd],1); pad=16
                 Hh,Ww = both.shape[:2]; canvas = np.full((Hh+2*pad, Ww+2*pad, 3), (40,40,40), np.uint8)
                 canvas[pad:pad+Hh, pad:pad+Ww] = both
@@ -718,7 +757,34 @@ class LossNaNGuard:
                 fname = save_dir/f"nan_batch_e{e:03d}_i{int(step):06d}.jpg"; plot_images(images=batch["img"], batch=batch, fname=fname)
                 LOGGER.error(f"[NaNGuard] saved bad batch -> {fname}")
             except Exception as ex: LOGGER.error(f"[NaNGuard] save-batch failed: {ex}")
-        if self.stop_on_nan: raise RuntimeError("[NaNGuard] Stop due to NaN")
+        # enrich context trước khi dừng
+        try:
+            B = getattr(trainer, "batch", None)
+            imgs = (B.get("img") if isinstance(B, dict) else (B[0] if B else None))
+
+            def _mm(x):
+                try:
+                    return (float(x.min().item()), float(x.max().item()))
+                except Exception:
+                    return (None, None)
+
+            img_minmax = _mm(imgs) if hasattr(imgs, "dtype") else (None, None)
+            lr = None
+            try:
+                for g in trainer.optimizer.param_groups:
+                    lr = g.get("lr", None);
+                    break
+            except Exception:
+                pass
+            # loss_items nếu có
+            li = getattr(trainer, "loss_items", None)
+            li = [float(v) for v in li] if li is not None else None
+            LOGGER.error(f"[NaNGuard/ctx] img_minmax={img_minmax} lr={lr} loss_items={li}")
+        except Exception:
+            pass
+
+        if self.stop_on_nan:
+            raise RuntimeError("[NaNGuard] Stop due to NaN")
 
 class BatchSanityFilter:
     def __init__(self, eps: float = 1e-6): self.eps = float(eps)

@@ -30,7 +30,7 @@ deterministic: False # (bool) whether to enable deterministic mode
 single_cls: False # (bool) train multi-class data as single-class
 rect: False # (bool) rectangular training if mode='train' or rectangular validation if mode='val'
 cos_lr: False # (bool) use cosine learning rate scheduler
-close_mosaic: 50 # (int) disable mosaic augmentation for final epochs (0 to disable)
+close_mosaic: 20 # (int) disable mosaic augmentation for final epochs (0 to disable)
 resume: False # (bool) resume training from last checkpoint
 amp: True # (bool) Automatic Mixed Precision (AMP) training, choices=[True, False], True runs AMP check
 fraction: 1.00 # (float) dataset fraction to train on (default is 1.0, all images in train set)
@@ -109,13 +109,13 @@ translate: 0.0 # (float) image translation (+/- fraction)
 scale: 0.10 # (float) image scale (+/- gain)
 shear: 0.10 # (float) image shear (+/- deg)
 perspective: 0.0 # (float) image perspective (+/- fraction), range 0-0.001
-flipud: 0.00 # (float) image flip up-down (probability)
-fliplr: 0.00 # (float) image flip left-right (probability)
+flipud: 0.5 # (float) image flip up-down (probability)
+fliplr: 0.5 # (float) image flip left-right (probability)
 bgr: 0.0 # (float) image channel BGR (probability)
 mosaic: 1.00 # (float) image mosaic (probability)
 mixup: 0.5 # (float) image mixup (probability)
-cutmix: 0.00 # (float) image cutmix (probability)
-copy_paste: 0.00 # (float) segment copy-paste (probability)
+cutmix: 0.5 # (float) image cutmix (probability)
+copy_paste: 0.25 # (float) segment copy-paste (probability)
 copy_paste_mode: "flip" # (str) the method to do copy_paste augmentation (flip, mixup)
 auto_augment: randaugment # (str) auto augmentation policy for classification (randaugment, autoaugment, augmix)
 erasing: 0.4 # (float) probability of random erasing during classification training (0-0.9), 0 means no erasing, must be less than 1.0.

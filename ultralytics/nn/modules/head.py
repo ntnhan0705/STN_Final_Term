@@ -256,6 +256,19 @@ class DetectSDTN(Detect):
         x: list feature P3, P4, P5.
         Nếu self.active=False ➜ bỏ qua de-warp.
         """
+        if not hasattr(self, "_log_once"):
+            try:
+                xs = []
+                for xi in (x if isinstance(x, (list, tuple)) else [x]):
+                    try:
+                        xs.append(tuple(xi.shape))
+                    except Exception:
+                        xs.append(type(xi).__name__)
+                LOGGER.info(f"[DetectSDTN] forward() in-shapes={xs}")
+            except Exception:
+                pass
+            self._log_once = True
+
         if self.active and isinstance(x, (list, tuple)):
             self._lazy_find_stn()
             if self._stn and self._stn.theta is not None:
