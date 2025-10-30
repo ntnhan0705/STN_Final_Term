@@ -52,16 +52,7 @@ __all__ = (
     "SCDown",
     "TorchVision",
 )
-
-# ============================================================
-# SpatialTransformer – STN backbone (gắn đầu vào)
-#   • self.enabled : True  → warp ảnh (STN on)
-#                    False → trả lại ảnh gốc (identity)
-#
-# Khi model khởi tạo, input đầu vào có 3 kênh → chúng ta bypass
-# đến đúng chỗ c_in kênh (ví dụ 35) mới warp. Đồng thời convert
-# dtype để tránh lỗi Half vs Float.
-# ============================================================
+# -------------------------------------------------------------------- (ntnhan.0705)
 class SpatialTransformer(nn.Module):
     """
     Spatial-Transformer đơn giản cho YOLO.
@@ -73,120 +64,153 @@ class SpatialTransformer(nn.Module):
     registry: list["SpatialTransformer"] = []
 
     def __init__(self, c1: int):
+        """
+        Parameters
+        ----------
+        c1 : số kênh đầu vào kỳ vọng (3 nếu không concat, 35 nếu concat …)
+        """
         super().__init__()
+
         self._stn_last_out = None
         SpatialTransformer.registry.append(self)
-        self.c_in = c1
-        self.enabled = True
-        self._stn_log_counter = 0
-        self._stn_log_interval = 200
 
-        # --- Localization Network ---
+        self.c_in = c1
+        self.enabled = True  # callback ngoài sẽ bật/tắt
+
+        # <<< THÊM BIẾN ĐẾM VÀ INTERVAL >>>
+        self._stn_train_log_counter = 0
+        self._stn_val_log_counter = 0  # Thêm counter riêng cho validation
+        self._stn_log_interval = 200  # In log mỗi 200 batch (cho training)
+        self._stn_val_log_interval = 50  # In log mỗi 50 batch (cho validation)
+        # <<< KẾT THÚC THÊM BIẾN >>>
+
+        # ---------- localisation network (xử lý float32) ----------
         self.localization = nn.Sequential(
             nn.Conv2d(c1, 32, 7, padding=3, bias=False),
             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
+
             nn.Conv2d(32, 64, 5, padding=2, bias=False),
             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
+
             nn.AdaptiveAvgPool2d((6, 6)),
         )
 
-        # --- Regressor θ ---
+        # ---------- regressor θ (Ép sang float32) ----------
         self.fc_loc = nn.Sequential(
             nn.Linear(64 * 6 * 6, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, 6),
         )
+        self.fc_loc.float()  # <<< ÉP fc_loc sang float32 để tránh lỗi dtype
+
+        # init θ = identity
         nn.init.zeros_(self.fc_loc[2].weight)
         self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float32))
 
-        # --- Tiện ích log ---
-        self.theta: torch.Tensor | None = None
+        # ---------- tiện ích log ----------
+        self.theta: torch.Tensor | None = None  # luôn gán ở forward (float32)
         self.record_theta: callable | None = None
-        self.stn_last_out = None
+        self.stn_last_out = None  # public: để loss đọc (float32)
 
+    # ------------------------- helpers -------------------------------
     @staticmethod
     def _identity_theta(batch: int, device, dtype=torch.float32) -> torch.Tensor:
+        """Trả batch×θ đồng-nhất [[1,0,0],[0,1,0]] dạng float32."""
         eye = torch.tensor([1, 0, 0, 0, 1, 0], device=device, dtype=dtype)
         if batch > 0:
-             return eye.view(1, 2, 3).expand(batch, -1, -1).contiguous()
+            return eye.view(1, 2, 3).expand(batch, -1, -1).contiguous()
         else:
-             return torch.empty((0, 2, 3), device=device, dtype=dtype)
+            return torch.empty((0, 2, 3), device=device, dtype=dtype)
 
+    # --------------------------- FORWARD -----------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, c, H, W = x.shape
-        original_dtype = x.dtype
+        original_dtype = x.dtype  # Lưu lại dtype gốc (có thể là float16)
 
         # --- Logging Counter & Interval Check ---
         if self.training:
-            if not hasattr(self, '_stn_log_counter'): self._stn_log_counter = 0
-            self._stn_log_counter += 1
-            current_counter = self._stn_log_counter
-        else:
-            current_counter = 1
-            if not hasattr(self, '_stn_log_counter'): self._stn_log_counter = 1
-        log_interval = getattr(self, '_stn_log_interval', 200)
-        log_this_batch = (current_counter == 1 or (self.training and current_counter % log_interval == 0))
+            if not hasattr(self, '_stn_train_log_counter'): self._stn_train_log_counter = 0
+            self._stn_train_log_counter += 1
+            current_counter = self._stn_train_log_counter
+            log_interval = getattr(self, '_stn_log_interval', 500)
+        else:  # Validation hoặc Prediction
+            if not hasattr(self, '_stn_val_log_counter'): self._stn_val_log_counter = 0
+            self._stn_val_log_counter += 1
+            current_counter = self._stn_val_log_counter
+            log_interval = getattr(self, '_stn_val_log_interval', 50)  # Dùng interval của validation
+
+        log_this_batch = (current_counter == 1 or (current_counter % log_interval == 0))
+        # <<< KẾT THÚC SỬA LOGIC COUNTER >>>
 
         # --- BYPASS Check ---
         if c < self.c_in or not self.enabled:
             self.theta = self._identity_theta(B, x.device, torch.float32)
-            if log_this_batch:
+            if log_this_batch:  # Chỉ log khi đến lượt
                 LOGGER.info(f"[STN DEBUG] (Batch {current_counter}, Training={self.training}) "
                             f"Forward bypassed (enabled={self.enabled}, c={c} < c_in={self.c_in}). Theta set to identity.")
+
             if self.record_theta:
                 self.record_theta(self.theta)
-                if log_this_batch:
-                     LOGGER.info(f"[STN DEBUG] (Batch {current_counter}) Called record_theta with identity theta shape: {self.theta.shape}")
-            elif log_this_batch:
-                 LOGGER.warning(f"[STN DEBUG] (Batch {current_counter}) record_theta callback is None during bypass!")
-            out = x[:, :3]
-            self.stn_last_out = out.detach().clone().float()
+
+            out = x[:, :3]  # Giữ dtype gốc
+            self.stn_last_out = out.detach().clone().float()  # Lưu float32
             return out
 
         # --- STN Active ---
         try:
-            img_rgb = x[:, :3].float()
+            img_rgb = x[:, :3].float()  # Input cho grid_sample luôn là float32
+
+            # Để autocast (bên ngoài) quản lý dtype cho localization (Conv/BN)
+            # feat_loc có thể là float16 nếu AMP bật
             feat_loc = self.localization(x).view(B, -1)
 
-            # --- Theta Regression (Tính trong context float32) ---
-            # Sử dụng autocast đã import ở đầu file
+            # --- Theta Regression (Ép tính toán float32) ---
+            # Sử dụng autocast(float32) để ép fc_loc (đã là float32)
+            # và input của nó (feat_loc.float()) cùng chạy ở float32
             with autocast(device_type=x.device.type, dtype=torch.float32):
-                 theta = self.fc_loc(feat_loc.float()).view(B, 2, 3)
+                theta = self.fc_loc(feat_loc.float()).view(B, 2, 3)  # Output theta sẽ là float32
 
-            self.theta = theta.detach()
+            self.theta = theta.detach()  # Lưu theta float32 đã detach
 
             # --- Logging ---
-            if log_this_batch:
+            if log_this_batch:  # Chỉ log khi đến lượt
                 try:
                     theta_sample = self.theta[0].cpu().numpy()
                     theta_val_str = f"[[{theta_sample[0, 0]:.4f}, {theta_sample[0, 1]:.4f}, {theta_sample[0, 2]:.4f}], [{theta_sample[1, 0]:.4f}, {theta_sample[1, 1]:.4f}, {theta_sample[1, 2]:.4f}]]"
-                    is_identity_check = torch.allclose(self.theta, self._identity_theta(B, self.theta.device, torch.float32), atol=1e-4)
-                    LOGGER.info(f"[STN DEBUG] (Batch {current_counter}, Training={self.training}) Calculated theta (float32) shape: {self.theta.shape}, "
-                                f"mean: {self.theta.mean():.4f}, is_identity: {is_identity_check}. "
-                                f"Sample[0]: {theta_val_str}")
+                    is_identity_check = torch.allclose(self.theta,
+                                                       self._identity_theta(B, self.theta.device, torch.float32),
+                                                       atol=1e-4)
+                    LOGGER.info(
+                        f"[STN DEBUG] (Batch {current_counter}, Training={self.training}) Calculated theta (float32) shape: {self.theta.shape}, "
+                        f"mean: {self.theta.mean():.4f}, is_identity: {is_identity_check}. "
+                        f"Sample[0]: {theta_val_str}")
                 except Exception as e:
                     LOGGER.warning(f"[STN DEBUG] (Batch {current_counter}) Error logging theta details: {e}")
 
             # --- Record Theta Callback ---
             if self.record_theta:
-                self.record_theta(self.theta)
-                if log_this_batch:
-                    LOGGER.info(f"[STN DEBUG] (Batch {current_counter}) Called record_theta with calculated theta (float32) shape: {self.theta.shape}")
-            elif log_this_batch:
+                self.record_theta(self.theta)  # Truyền theta float32 đã detach
+                if log_this_batch:  # Chỉ log khi đến lượt
+                    LOGGER.info(
+                        f"[STN DEBUG] (Batch {current_counter}) Called record_theta with calculated theta (float32) shape: {self.theta.shape}")
+            elif log_this_batch:  # Chỉ log warning nếu đến lượt
                 LOGGER.warning(f"[STN DEBUG] (Batch {current_counter}) record_theta callback is None!")
 
             # --- Grid Sample (Input và Grid đều float32) ---
-            grid = F.affine_grid(self.theta, (B, 3, H, W), align_corners=False)
-            warped = F.grid_sample(img_rgb, grid, align_corners=False)
+            grid = F.affine_grid(self.theta, (B, 3, H, W), align_corners=False)  # grid float32
+            warped = F.grid_sample(img_rgb, grid, align_corners=False)  # warped float32
 
             self._stn_last_out = warped.detach()
 
+            # Trả về ảnh warped, chuyển về dtype gốc của input x
             return warped.to(original_dtype)
 
         except Exception as e:
-            LOGGER.error(f"[STN ERROR] Error during STN forward pass (Batch {current_counter}, Training={self.training}): {e}", exc_info=True)
+            LOGGER.error(
+                f"[STN ERROR] Error during STN forward pass (Batch {current_counter}, Training={self.training}): {e}",
+                exc_info=True)
             LOGGER.error(f"Input x dtype: {x.dtype}, shape: {x.shape}")
             try:
                 loc_param_dtypes = {name: p.dtype for name, p in self.localization.named_parameters()}
@@ -194,9 +218,10 @@ class SpatialTransformer(nn.Module):
                 LOGGER.error(f"Localization param dtypes: {loc_param_dtypes}")
                 LOGGER.error(f"FC loc param dtypes: {fc_param_dtypes}")
                 if 'feat_loc' in locals():
-                     LOGGER.error(f"Feature tensor 'feat_loc' (after localization) dtype: {feat_loc.dtype}, shape: {feat_loc.shape}")
+                    LOGGER.error(
+                        f"Feature tensor 'feat_loc' (after localization) dtype: {feat_loc.dtype}, shape: {feat_loc.shape}")
                 if 'theta' in locals():
-                     LOGGER.error(f"Calculated 'theta' (before detach) dtype: {theta.dtype}, shape: {theta.shape}")
+                    LOGGER.error(f"Calculated 'theta' (before detach) dtype: {theta.dtype}, shape: {theta.shape}")
             except Exception as detail_e:
                 LOGGER.error(f"Could not get detailed dtype info: {detail_e}")
             LOGGER.error("Falling back to returning original image slice due to error.")
@@ -205,7 +230,7 @@ class SpatialTransformer(nn.Module):
             if self.record_theta: self.record_theta(self.theta)
             self._stn_last_out = out.detach().clone().float()
             return out
-
+# -------------------------------------------------------------------- (ntnhan.0705)
 class DFL(nn.Module):
     """
     Integral module of Distribution Focal Loss (DFL).

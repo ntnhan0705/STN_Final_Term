@@ -17,7 +17,7 @@ from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residu
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
-
+from torch.amp import autocast
 from torch import Tensor
 from .block import SpatialTransformer
 __all__ = "Detect", "DetectSDTN", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
@@ -187,34 +187,26 @@ class Detect(nn.Module):
         i = torch.arange(batch_size)[..., None]  # batch indices
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
 
-
 # -------------------------------------------------------------------- (ntnhan.0705)
 def _invert_affine(theta: Tensor) -> Tensor:
     """Đảo batch affine 2×3 (B,2,3) ⇒ (B,2,3). Đảm bảo hoạt động với float32."""
     B = theta.size(0)
-    if B == 0: # Thêm kiểm tra batch rỗng
+    if B == 0:
         return torch.empty((0, 2, 3), device=theta.device, dtype=torch.float32)
 
-    # <<< THÊM ÉP KIỂU NGAY TRƯỚC KHI DÙNG >>>
-    # Đảm bảo theta là float32 trước khi thực hiện các phép toán linalg
-    theta_float = theta.float()
-    # <<< KẾT THÚC ÉP KIỂU >>>
+    # Bọc toàn bộ trong autocast(float32)
+    with autocast(device_type=theta.device.type, dtype=torch.float32):
+        theta_float = theta.float()  # Đảm bảo input là float32
 
-    # ghép hàng [0 0 1] ➜ 3×3, rồi inverse (sử dụng theta_float)
-    # Tạo bottom tensor cùng device và dtype float32
-    bottom = torch.tensor([[0.0, 0.0, 1.0]], device=theta_float.device, dtype=torch.float32).expand(B, -1, -1) # Shape (B, 1, 3)
-    full   = torch.cat([theta_float, bottom], dim=1)              # (B,3,3), float32
+        bottom = torch.tensor([[0.0, 0.0, 1.0]], device=theta_float.device, dtype=torch.float32).expand(B, -1, -1)
+        full = torch.cat([theta_float, bottom], dim=1)
 
-    # Tính nghịch đảo - input `full` đảm bảo là float32
-    try:
-        inv = torch.linalg.inv(full)[:, :2]                     # (B,2,3), float32
-    except Exception as e:
-        LOGGER.error(f"Error during torch.linalg.inv: {e}. Input shape: {full.shape}, dtype: {full.dtype}")
-        # Fallback: Trả về ma trận identity nếu không nghịch đảo được
-        inv = torch.tensor([[1., 0., 0.], [0., 1., 0.]], device=theta_float.device, dtype=torch.float32).expand(B, -1, -1)
-
-    # Trả về kết quả float32
-    return inv
+        try:
+            inv = torch.linalg.inv(full)[:, :2]
+        except Exception as e:
+            LOGGER.error(f"Error during torch.linalg.inv: {e}. Input shape: {full.shape}, dtype: {full.dtype}")
+            inv = torch.tensor([[1., 0., 0.], [0., 1., 0.]], device=theta_float.device, dtype=torch.float32).expand(B,-1,-1)
+    return inv  # Trả về float32
 
 class DetectSDTN(Detect):
     """
@@ -225,9 +217,14 @@ class DetectSDTN(Detect):
 
     def __init__(self, nc=80, ch=()):
         super().__init__(nc, ch)
-        self._stn: SpatialTransformer | None = None   # tìm lười biếng
-        self.active = True                            # callback ngoài có thể tắt
-        self._log_counter = 0 # <<< THÊM BIẾN ĐẾM >>>
+        self._stn: SpatialTransformer | None = None  # tìm lười biếng
+        self.active = True  # callback ngoài có thể tắt
+        # <<< THÊM BIẾN ĐẾM RIÊNG BIỆT >>>
+        self._train_log_counter = 0
+        self._val_log_counter = 0
+        self._log_interval = 500  # Interval cho training
+        self._val_log_interval = 50  # Interval cho validation
+        # <<< KẾT THÚC THÊM BIẾN >>>
 
     # ---------------- private helpers -----------------
     def _lazy_find_stn(self):
@@ -238,52 +235,58 @@ class DetectSDTN(Detect):
                 self._stn = SpatialTransformer.registry[0]
                 LOGGER.info("[DetectSDTN DEBUG] Found STN via global registry.")
             else:
-                LOGGER.warning("[DetectSDTN DEBUG] SpatialTransformer.registry is empty or not found. STN module instance not located.")
-                self._stn = None # Đảm bảo _stn là None nếu không tìm thấy
+                LOGGER.warning(
+                    "[DetectSDTN DEBUG] SpatialTransformer.registry is empty or not found. STN module instance not located.")
+                self._stn = None  # Đảm bảo _stn là None nếu không tìm thấy
 
             # 2) Nếu không tìm được STN thật, tạo "STN giả" chứa theta = identity
             if self._stn is None:
                 LOGGER.info("[DetectSDTN DEBUG] Creating Mock STN with identity theta as fallback.")
-                # Tạo một đối tượng đơn giản có thuộc tính 'theta'
+
                 class MockSTN:
                     def __init__(self, identity_theta):
                         self.theta = identity_theta
-                try:
-                     # Lấy device và dtype từ một parameter của head để đảm bảo tương thích
-                     device = next(self.parameters()).device
-                     dtype = torch.float32 # Theta thường là float32
-                     # Tạo theta identity với batch_size=1 (sẽ tự broadcast khi cần)
-                     eye = torch.tensor([[1., 0., 0.], [0., 1., 0.]], device=device, dtype=dtype)
-                     theta_identity = eye.view(1, 2, 3)
-                     self._stn = MockSTN(theta_identity)
-                     # Kiểm tra lại xem mock có theta không
-                     if not hasattr(self._stn, 'theta') or self._stn.theta is None:
-                          LOGGER.error("[DetectSDTN DEBUG] Failed to initialize Mock STN theta.")
-                          self._stn = None # Reset về None nếu mock lỗi
-                except Exception as e:
-                     LOGGER.error(f"[DetectSDTN DEBUG] Exception creating Mock STN: {e}")
-                     self._stn = None # Đảm bảo _stn là None nếu có lỗi
 
-        # Trả về _stn tìm được hoặc mock STN (hoặc None nếu cả hai đều thất bại)
+                try:
+                    device = next(self.parameters()).device
+                    dtype = torch.float32
+                    eye = torch.tensor([[1., 0., 0.], [0., 1., 0.]], device=device, dtype=dtype)
+                    theta_identity = eye.view(1, 2, 3)
+                    self._stn = MockSTN(theta_identity)
+                    if not hasattr(self._stn, 'theta') or self._stn.theta is None:
+                        LOGGER.error("[DetectSDTN DEBUG] Failed to initialize Mock STN theta.")
+                        self._stn = None
+                except Exception as e:
+                    LOGGER.error(f"[DetectSDTN DEBUG] Exception creating Mock STN: {e}")
+                    self._stn = None
+
         return self._stn
 
     @staticmethod
     def _dewarp_feats(
-        feats: list[Tensor] | tuple[Tensor, ...],
-        theta_inv: Tensor
+            feats: list[Tensor] | tuple[Tensor, ...],
+            theta_inv: Tensor  # theta_inv từ _invert_affine đã là float32
     ) -> list[Tensor]:
-        """Affine-grid + grid-sample cho từng feature‐map."""
+        """Affine-grid + grid-sample cho từng feature‐map. Đảm bảo chạy ở float32."""
         out = []
-        for f in feats:                 # mỗi f: (B,C,H,W)
-            B, C, H, W = f.shape
-            grid = F.affine_grid(theta_inv, (B, C, H, W), align_corners=False)
-            out.append(
-                F.grid_sample(
-                    f, grid,
+        # Ép các phép toán hình học này chạy ở float32
+        with autocast(device_type=theta_inv.device.type, dtype=torch.float32):
+            for f in feats:  # f có thể là float16
+                B, C, H, W = f.shape
+                # Chuyển feature map sang float32 *nếu chưa phải*
+                f_float = f.float() if f.dtype != torch.float32 else f
+
+                # affine_grid yêu cầu theta float32 (theta_inv đã là float32)
+                grid = F.affine_grid(theta_inv, (B, C, H, W), align_corners=False)  # grid là float32
+
+                warped_float = F.grid_sample(
+                    f_float, grid,
                     mode="bilinear", padding_mode="zeros",
                     align_corners=False
                 )
-            )
+
+                # Chuyển kết quả về dtype gốc của feature map
+                out.append(warped_float.to(f.dtype))
         return out
 
     # ---------------- forward -------------------------
@@ -292,24 +295,26 @@ class DetectSDTN(Detect):
         x: list feature P3, P4, P5.
         Nếu self.active=False ➜ bỏ qua de-warp.
         """
-        # <<< THÊM BIẾN ĐẾM VÀ ĐIỀU KIỆN IN LOG >>>
-        log_interval = 500 # In log mỗi 500 batch
-        log_this_batch = False
-        if hasattr(self, '_log_counter'):
-             self._log_counter += 1
-             # In ở batch đầu tiên (counter=1) hoặc các batch là bội số của interval
-             if self._log_counter == 1 or self._log_counter % log_interval == 0:
-                  log_this_batch = True
-        else: # Khởi tạo nếu chưa có
-             self._log_counter = 1
-             log_this_batch = True
-        # <<< KẾT THÚC THÊM BIẾN ĐẾM >>>
+        # --- Logging Counter & Interval Check ---
+        if self.training:
+            if not hasattr(self, '_train_log_counter'): self._train_log_counter = 0
+            self._train_log_counter += 1
+            current_counter = self._train_log_counter
+            log_interval = getattr(self, '_log_interval', 500)
+        else:  # Validation hoặc Prediction
+            if not hasattr(self, '_val_log_counter'): self._val_log_counter = 0
+            self._val_log_counter += 1
+            current_counter = self._val_log_counter
+            log_interval = getattr(self, '_val_log_interval', 50)  # Dùng interval của validation
+
+        log_this_batch = (current_counter == 1 or (current_counter % log_interval == 0))
+        # <<< KẾT THÚC SỬA LOGIC COUNTER >>>
 
         theta_from_stn = None
         stn_found = False
-        stn_instance = None # Biến tạm để giữ instance STN tìm được
+        stn_instance = None
         try:
-            stn_instance = self._lazy_find_stn() # Gọi hàm đã sửa
+            stn_instance = self._lazy_find_stn()
             if stn_instance and hasattr(stn_instance, 'theta') and stn_instance.theta is not None:
                 theta_from_stn = stn_instance.theta
                 stn_found = True
@@ -317,79 +322,62 @@ class DetectSDTN(Detect):
             is_active = self.active and isinstance(x, (list, tuple))
             theta_shape = theta_from_stn.shape if theta_from_stn is not None else "None"
 
-            # Chỉ in nếu đến lượt
-            if log_this_batch:
-                 # In thêm giá trị theta sample đầu tiên
-                 theta_val_str = "N/A"
-                 if theta_from_stn is not None and theta_from_stn.numel() > 0:
-                      # Đảm bảo index không vượt quá batch size thực tế
-                      sample_idx = 0
-                      current_batch_size = theta_from_stn.shape[0]
-                      if sample_idx < current_batch_size:
-                           theta_sample = theta_from_stn[sample_idx].detach().cpu().numpy()
-                           theta_val_str = f"[[{theta_sample[0, 0]:.4f}, {theta_sample[0, 1]:.4f}, {theta_sample[0, 2]:.4f}], [{theta_sample[1, 0]:.4f}, {theta_sample[1, 1]:.4f}, {theta_sample[1, 2]:.4f}]]"
-                      else:
-                           theta_val_str = f"Index {sample_idx} out of bounds for batch size {current_batch_size}"
-
-
-                 LOGGER.info(f"[DetectSDTN DEBUG] (Batch {self._log_counter}) "
-                             f"active={is_active}, stn_found={stn_found}, theta shape: {theta_shape}. "
-                             f"Sample[0]: {theta_val_str}") # In giá trị theta
-
+            if log_this_batch:  # Chỉ log khi đến lượt
+                theta_val_str = "N/A"
+                if theta_from_stn is not None and theta_from_stn.numel() > 0:
+                    sample_idx = 0
+                    current_batch_size = theta_from_stn.shape[0]
+                    if sample_idx < current_batch_size:
+                        theta_sample = theta_from_stn[sample_idx].detach().cpu().numpy()
+                        theta_val_str = f"[[{theta_sample[0, 0]:.4f}, {theta_sample[0, 1]:.4f}, {theta_sample[0, 2]:.4f}], [{theta_sample[1, 0]:.4f}, {theta_sample[1, 1]:.4f}, {theta_sample[1, 2]:.4f}]]"
+                    else:
+                        theta_val_str = f"Index {sample_idx} out of bounds for B={current_batch_size}"
+                LOGGER.info(f"[DetectSDTN DEBUG] (Batch {current_counter}, Training={self.training}) "
+                            f"active={is_active}, stn_found={stn_found}, theta shape: {theta_shape}. "
+                            f"Sample[0]: {theta_val_str}")
         except Exception as e:
-            # Chỉ in nếu đến lượt
-            if log_this_batch:
-                 LOGGER.warning(f"[DetectSDTN DEBUG] (Batch {self._log_counter}) Error checking theta: {e}")
+            if log_this_batch:  # Chỉ log khi đến lượt
+                LOGGER.warning(f"[DetectSDTN DEBUG] (Batch {current_counter}) Error checking theta: {e}")
 
-        # Thực hiện de-warp nếu cần
+        # --- STN Active ---
         if self.active and isinstance(x, (list, tuple)):
-            # Dùng stn_instance đã lấy ở trên, không cần gọi lại _lazy_find_stn()
             if stn_instance and hasattr(stn_instance, 'theta') and stn_instance.theta is not None:
                 try:
-                    # Đảm bảo theta có cùng batch size với features trước khi invert và dewarp
                     current_batch_size_feat = x[0].shape[0]
                     theta_batch_size = stn_instance.theta.shape[0]
+                    theta_to_use = None
 
                     if theta_batch_size == current_batch_size_feat:
-                         theta_to_use = stn_instance.theta
+                        theta_to_use = stn_instance.theta
                     elif theta_batch_size == 1 and current_batch_size_feat > 1:
-                         # Nếu theta là (1, 2, 3) và batch > 1, broadcast nó
-                         theta_to_use = stn_instance.theta.expand(current_batch_size_feat, -1, -1)
-                         if log_this_batch:
-                              LOGGER.info(f"[DetectSDTN DEBUG] (Batch {self._log_counter}) Broadcasted theta from shape {stn_instance.theta.shape} to {theta_to_use.shape}")
+                        theta_to_use = stn_instance.theta.expand(current_batch_size_feat, -1, -1)
                     else:
-                         # Trường hợp không khớp batch size không mong muốn
-                         if log_this_batch:
-                              LOGGER.error(f"[DetectSDTN DEBUG] (Batch {self._log_counter}) Mismatch batch size! Theta: {theta_batch_size}, Feats: {current_batch_size_feat}. Skipping de-warp.")
-                         # Không thực hiện de-warp nếu batch size không khớp
-                         theta_to_use = None # Đặt lại để bỏ qua de-warp
+                        if log_this_batch:
+                            LOGGER.error(
+                                f"[DetectSDTN DEBUG] (Batch {current_counter}) Mismatch batch size! Theta: {theta_batch_size}, Feats: {current_batch_size_feat}. Skipping de-warp.")
 
-                    # Chỉ de-warp nếu theta_to_use hợp lệ
                     if theta_to_use is not None:
-                         theta_inv = _invert_affine(theta_to_use)
-                         x_dewarped = self._dewarp_feats(x, theta_inv)
+                        theta_inv = _invert_affine(theta_to_use)  # Gọi hàm đã sửa
+                        x_dewarped = self._dewarp_feats(x, theta_inv)  # Gọi hàm đã sửa
 
-                         # Chỉ in nếu đến lượt
-                         if log_this_batch:
-                              feat_shapes_before = [f.shape for f in x]
-                              feat_shapes_after = [f.shape for f in x_dewarped]
-                              LOGGER.info(f"[DetectSDTN DEBUG] (Batch {self._log_counter}) De-warped features. "
-                                          f"Before: {feat_shapes_before}, After: {feat_shapes_after}")
-                         x = x_dewarped
-                    # else: # Log lỗi đã được xử lý ở trên
+                        if log_this_batch:
+                            feat_shapes_before = [f.shape for f in x]
+                            feat_shapes_after = [f.shape for f in x_dewarped]  # Sửa tên biến
+                            LOGGER.info(f"[DetectSDTN DEBUG] (Batch {current_counter}) De-warped features. "
+                                        f"Before: {feat_shapes_before}, After: {feat_shapes_after}")
+                        x = x_dewarped  # Gán lại x
 
                 except Exception as e:
-                     # Chỉ in nếu đến lượt
-                     if log_this_batch:
-                          LOGGER.error(f"[DetectSDTN DEBUG] (Batch {self._log_counter}) Error during de-warping: {e}. Using original features.")
-                     # Giữ nguyên x nếu có lỗi
+                    if log_this_batch:
+                        LOGGER.error(
+                            f"[DetectSDTN DEBUG] (Batch {current_counter}) Error during de-warping: {e}. Using original features.",
+                            exc_info=True)
             else:
-                 # Chỉ in nếu đến lượt
-                 if log_this_batch:
-                     LOGGER.warning(f"[DetectSDTN DEBUG] (Batch {self._log_counter}) "
-                                    f"STN found={stn_found} but theta is None or invalid. Skipping de-warp.")
+                if log_this_batch:
+                    LOGGER.warning(f"[DetectSDTN DEBUG] (Batch {current_counter}) "
+                                   f"STN found={stn_found} but theta is None or invalid. Skipping de-warp.")
 
-        # Gọi Detect.forward (original) để tính logits / loss
+        # gọi Detect.forward (original) để tính logits / loss
         return super().forward(x)
 # -------------------------------------------------------------------- (ntnhan.0705)
 

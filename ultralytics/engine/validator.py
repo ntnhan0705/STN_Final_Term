@@ -199,12 +199,13 @@ class BaseValidator:
             Profile(device=self.device),
             Profile(device=self.device),
         )
-        bar = TQDM(self.dataloader, desc=self.get_desc(), total=len(self.dataloader))
-        self.init_metrics(de_parallel(model))
-        self.jdict = []  # empty before each val
+        bar = TQDM(self.dataloader, desc=self.pbar_desc, total=len(self.dataloader))
+        self.init_metrics(model)
+        self.jdict = []  # L JSON
         for batch_i, batch in enumerate(bar):
             self.run_callbacks("on_val_batch_start")
             self.batch_i = batch_i
+
             # Preprocess
             with dt[0]:
                 batch = self.preprocess(batch)
@@ -219,17 +220,33 @@ class BaseValidator:
                     self.loss += model.loss(batch, preds)[1]
 
             # Postprocess
+            # <<< THÊM LOG DEBUG VỚI INTERVAL >>>
             try:
-                if isinstance(preds, torch.Tensor):
-                    LOGGER.info(f"[Validator DEBUG] Raw preds before NMS - shape: {preds.shape}, "
-                                f"max score: {preds[..., 4:].sigmoid().max():.4f}, "
-                                f"num > 0.01: {(preds[..., 4:].sigmoid() > 0.01).sum()}")
-                else:
-                    LOGGER.info(f"[Validator DEBUG] Raw preds type before NMS: {type(preds)}")
+                val_log_interval = 50  # Đặt interval là 50
+                if self.batch_i % val_log_interval == 0 or self.batch_i == 0:
+                    if isinstance(preds, torch.Tensor):
+                        LOGGER.info(
+                            f"[Validator DEBUG] (Batch {self.batch_i}) Raw preds before NMS - shape: {preds.shape}, "
+                            f"max score: {preds[..., 4:].sigmoid().max():.4f}, "
+                            f"num > 0.01: {(preds[..., 4:].sigmoid() > 0.01).sum()}")
+                    else:
+                        # preds có thể là tuple (preds, features)
+                        pred_tensor = preds[0] if isinstance(preds, (list, tuple)) else preds
+                        if isinstance(pred_tensor, torch.Tensor):
+                            LOGGER.info(
+                                f"[Validator DEBUG] (Batch {self.batch_i}) Raw preds[0] before NMS - shape: {pred_tensor.shape}, "
+                                f"max score: {pred_tensor[..., 4:].sigmoid().max():.4f}, "
+                                f"num > 0.01: {(pred_tensor[..., 4:].sigmoid() > 0.01).sum()}")
+                        else:
+                            LOGGER.info(
+                                f"[Validator DEBUG] (Batch {self.batch_i}) Raw preds type before NMS: {type(preds)}")
             except Exception as e:
-                LOGGER.warning(f"[Validator DEBUG] Error logging raw preds: {e}")
+                LOGGER.warning(f"[Validator DEBUG] (Batch {self.batch_i}) Error logging raw preds: {e}")
+            # <<< KẾT THÚC LOG DEBUG >>>
+
             with dt[3]:
                 preds = self.postprocess(preds)
+            # <<< KẾT THÚC SỬA ĐỔI >>>
 
             self.update_metrics(preds, batch)
             if self.args.plots and batch_i < 3:
