@@ -80,7 +80,7 @@ class SpatialTransformer(nn.Module):
         # <<< THÊM BIẾN ĐẾM VÀ INTERVAL >>>
         self._stn_train_log_counter = 0
         self._stn_val_log_counter = 0  # Thêm counter riêng cho validation
-        self._stn_log_interval = 200  # In log mỗi 200 batch (cho training)
+        self._stn_log_interval = 500  # In log mỗi 200 batch (cho training)
         self._stn_val_log_interval = 50  # In log mỗi 50 batch (cho validation)
         # <<< KẾT THÚC THÊM BIẾN >>>
 

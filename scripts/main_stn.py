@@ -256,7 +256,7 @@ def train_one(args: argparse.Namespace, run_id: int):
         yolo.add_callback("on_train_epoch_end", DebugBgPairROIs(epochs=range(args.epochs + 1), max_pairs=6).on_train_epoch_end)
 
     # θ stats: train mỗi 200 batch, val mỗi batch
-    yolo.add_callback("on_train_batch_end", ThetaStats(every=200, tag="train").on_train_batch_end)
+    yolo.add_callback("on_train_batch_end", ThetaStats(every=500, tag="train").on_train_batch_end)
     yolo.add_callback("on_val_batch_end",   ThetaStats(tag="val").on_val_batch_end)
 
     # J) VAL DEBUG OVERRIDES + PROBE IoU + CSV GUARD

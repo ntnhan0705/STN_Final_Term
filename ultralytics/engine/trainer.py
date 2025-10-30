@@ -577,7 +577,7 @@ class BaseTrainer:
             val_batch_size = batch_size if self.args.task == "obb" else batch_size * 2
             self.test_loader = self.get_dataloader(self.testset, batch_size=val_batch_size, rank=-1, mode="val")
             self.validator = self.get_validator()
-
+            self.validator.plots = self.plots
             _val_loss = self.label_loss_items(prefix="val")
             _val_keys = list(_val_loss.keys()) if isinstance(_val_loss, dict) else list(_val_loss)
             _metric_keys = list(self.validator.metrics.keys) + _val_keys

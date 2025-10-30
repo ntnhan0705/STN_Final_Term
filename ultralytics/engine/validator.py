@@ -91,9 +91,10 @@ class BaseValidator:
         eval_json: Evaluate and return JSON format of prediction statistics.
     """
 
-    def __init__(self, args, dataloader, save_dir, pbar):
+    def __init__(self, args=None, dataloader=None, save_dir=None, pbar=None):
         """Initializes a BaseValidator instance for validation."""
-        super().__init__()
+
+        super().__init__()  # Sửa lỗi TypeError
         self.args = args or get_cfg(DEFAULT_CFG)
         self.dataloader = dataloader
         self.save_dir = save_dir
@@ -106,8 +107,9 @@ class BaseValidator:
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.loss = torch.zeros(3)
         self.jdict = []
-        self.on_plot = self.plot_val_samples  # Callback for plotting validation samples
+        self.on_plot = self.on_plot
         self.pbar_desc = self.get_desc()
+
     @torch.no_grad()
     @smart_inference_mode()
     def __call__(self, trainer=None, model=None):
@@ -116,38 +118,64 @@ class BaseValidator:
         gets priority).
         """
         self.training = trainer is not None
+        augment = self.args.augment and (not self.training)
         if self.training:
             self.device = trainer.device
             self.data = trainer.data
-            self.args.half = trainer.amp  # TODO: val best model with amp=True
-            self.model = trainer.model
-            self.loss = torch.zeros_like(trainer.loss)
+            # self.args.half = trainer.amp # Tạm vô hiệu hóa, validator nên dùng args.half riêng
+            self.model = trainer.model  # Gán self.model để tham chiếu
+            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)  # Sửa lỗi từ trainer.loss
             self.args.plots |= trainer.args.plots
             self.metrics.speed = self.speed
             self.save_dir = trainer.save_dir
-            self.pbar = trainer.pbar
+
+            # Lấy model EMA (nếu có)
+            model = trainer.ema.ema or trainer.model
+            model = model.half() if self.args.half else model.float()
+
+            if self.pbar is None:
+                self.pbar = TQDM(self.dataloader, desc=self.pbar_desc, total=len(self.dataloader))
         else:
             callbacks.add_integration_callbacks(self)
             self.run_callbacks("on_val_start")
             assert model is not None, "Either trainer or model is required for validation"
             self.device = select_device(self.args.device, self.args.batch)
-            self.args.half &= self.device.type != "cpu"  # half precision only supported on CUDA
+            self.args.half &= self.device.type != "cpu"
             if self.args.half:
                 model.half()
-            self.model = model
+            self.model = model  # Gán self.model
             self.model.eval()
             self.data = self.get_data()
             if self.device.type == "cpu":
-                self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
+                self.args.workers = 0
             if not self.dataloader:
                 self.dataloader = self.get_dataloader(self.data.get(self.args.split), self.args.batch)
+
             if self.pbar is None:
                 self.pbar = TQDM(self.dataloader, desc=self.pbar_desc, total=len(self.dataloader))
+
             model.warmup(imgsz=(1 if self.args.pt else self.args.batch, 3, *self.args.imgsz))
 
         dt = (Profile(), Profile(), Profile(), Profile())
         bar = self.pbar
-        self.init_metrics(model)
+
+        # <<< SỬA LỖI 'NoneType' object has no attribute 'names' >>>
+        # Đảm bảo model (dù là EMA hay model gốc) có thuộc tính 'names'
+        # Lấy 'names' từ 'self.data' (đã được gán từ trainer.data ở trên)
+        if hasattr(self.data, 'names'):
+            model.names = self.data['names']
+        elif hasattr(self.model, 'names'):  # Fallback lấy từ self.model
+            model.names = self.model.names
+        else:
+            # Fallback nếu self.data cũng không có names (trường hợp hiếm)
+            LOGGER.warning("Validator could not find 'names' attribute on model or data. Using default names.")
+            # Tự tạo names dựa trên nc nếu có
+            if hasattr(self, 'nc') and self.nc:
+                model.names = {i: f'class_{i}' for i in range(self.nc)}
+            # Nếu không thì init_metrics sẽ thất bại (nhưng lỗi sẽ rõ ràng hơn)
+        # <<< KẾT THÚC SỬA LỖI >>>
+
+        self.init_metrics(de_parallel(model))  # Bây giờ model đã có .names
         self.jdict = []  # reset jdict
         for batch_i, batch in enumerate(bar):
             self.run_callbacks("on_val_batch_start")
@@ -158,31 +186,31 @@ class BaseValidator:
 
             # Inference
             with dt[1]:
-                preds = model(batch["img"], augment=self.args.augment)
+                preds = model(batch["img"], augment=augment)  # augment=self.args.augment
 
             # Loss
             with dt[2]:
                 if self.training:
-                    self.loss += model.loss(batch, preds)[1]
+                    if hasattr(self.model, 'loss') and callable(self.model.loss):  # Dùng self.model gốc để tính loss
+                        self.loss += self.model.loss(batch, preds)[1]
 
-            # <<< THÊM LOG DEBUG VỚI INTERVAL >>>
+            # <<< LOG DEBUG VỚI INTERVAL 50 BATCH (Giữ nguyên) >>>
             try:
-                val_log_interval = 50  # Đặt interval là 50
-                # Chỉ log ở batch 0 hoặc mỗi 50 batch
+                val_log_interval = 50
                 if self.batch_i % val_log_interval == 0:
                     pred_tensor = preds[0] if isinstance(preds, (list, tuple)) else preds
                     if isinstance(pred_tensor, torch.Tensor):
-                        # Tính toán score bên trong khối if để tiết kiệm tài nguyên
-                        scores = pred_tensor[..., 4:].sigmoid()
+                        scores_sigmoid = pred_tensor[..., 4:].sigmoid()
                         LOGGER.info(
                             f"[Validator DEBUG] (Batch {self.batch_i}) Raw preds[0] - shape: {pred_tensor.shape}, "
-                            f"max score: {scores.max():.4f}, "
-                            f"num > 0.01: {(scores > 0.01).sum()}")
+                            f"max score: {scores_sigmoid.max():.4f}, "
+                            f"num > 0.01: {(scores_sigmoid > 0.01).sum()}")
                     else:
                         LOGGER.info(
                             f"[Validator DEBUG] (Batch {self.batch_i}) Raw preds type before NMS: {type(preds)}")
             except Exception as e:
-                LOGGER.warning(f"[Validator DEBUG] (Batch {self.batch_i}) Error logging raw preds: {e}")
+                if self.batch_i % val_log_interval == 0:
+                    LOGGER.warning(f"[Validator DEBUG] (Batch {self.batch_i}) Error logging raw preds: {e}")
             # <<< KẾT THÚC LOG DEBUG >>>
 
             # Postprocess
