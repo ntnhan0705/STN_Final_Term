@@ -190,12 +190,30 @@ class Detect(nn.Module):
 
 # -------------------------------------------------------------------- (ntnhan.0705)
 def _invert_affine(theta: Tensor) -> Tensor:
-    """Đảo batch affine 2×3 (B,2,3) ⇒ (B,2,3)."""
+    """Đảo batch affine 2×3 (B,2,3) ⇒ (B,2,3). Đảm bảo hoạt động với float32."""
     B = theta.size(0)
-    # ghép hàng [0 0 1] ➜ 3×3, rồi inverse
-    bottom = theta.new_tensor([0.0, 0.0, 1.0]).view(1, 1, 3).expand(B, 1, 3)
-    full   = torch.cat([theta, bottom], dim=1)              # (B,3,3)
-    inv    = torch.inverse(full)[:, :2]                     # (B,2,3)
+    if B == 0: # Thêm kiểm tra batch rỗng
+        return torch.empty((0, 2, 3), device=theta.device, dtype=torch.float32)
+
+    # <<< THÊM ÉP KIỂU NGAY TRƯỚC KHI DÙNG >>>
+    # Đảm bảo theta là float32 trước khi thực hiện các phép toán linalg
+    theta_float = theta.float()
+    # <<< KẾT THÚC ÉP KIỂU >>>
+
+    # ghép hàng [0 0 1] ➜ 3×3, rồi inverse (sử dụng theta_float)
+    # Tạo bottom tensor cùng device và dtype float32
+    bottom = torch.tensor([[0.0, 0.0, 1.0]], device=theta_float.device, dtype=torch.float32).expand(B, -1, -1) # Shape (B, 1, 3)
+    full   = torch.cat([theta_float, bottom], dim=1)              # (B,3,3), float32
+
+    # Tính nghịch đảo - input `full` đảm bảo là float32
+    try:
+        inv = torch.linalg.inv(full)[:, :2]                     # (B,2,3), float32
+    except Exception as e:
+        LOGGER.error(f"Error during torch.linalg.inv: {e}. Input shape: {full.shape}, dtype: {full.dtype}")
+        # Fallback: Trả về ma trận identity nếu không nghịch đảo được
+        inv = torch.tensor([[1., 0., 0.], [0., 1., 0.]], device=theta_float.device, dtype=torch.float32).expand(B, -1, -1)
+
+    # Trả về kết quả float32
     return inv
 
 class DetectSDTN(Detect):
