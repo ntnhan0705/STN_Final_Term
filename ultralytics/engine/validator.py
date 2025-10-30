@@ -107,7 +107,7 @@ class BaseValidator:
         self.loss = torch.zeros(3)
         self.jdict = []
         self.on_plot = self.plot_val_samples  # Callback for plotting validation samples
-
+        self.pbar_desc = self.get_desc()
     @torch.no_grad()
     @smart_inference_mode()
     def __call__(self, trainer=None, model=None):

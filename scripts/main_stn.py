@@ -405,8 +405,8 @@ def parse_args() -> argparse.Namespace:
         args.tsne_per_class = 300
         args.pairing = True
         args.bgpair_map = DEMO_BGPAIR
-        args.save = 1
-        args.save_period = -1
+        args.save = 0
+        args.save_period = 0
         args.amp = 1
         args.freeze_epochs = 0
         return args
