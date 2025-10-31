@@ -1,5 +1,14 @@
 # main_stn.py (slim v6, fixed & instrumented) — Stabilize mAP, correct STN tap, val-identity window, rich debug logs
 from __future__ import annotations
+import sys
+from pathlib import Path
+# Thêm thư mục gốc (STN_Final_Term) vào sys.path
+# để Python ưu tiên import code đã sửa trong thư mục ./ultralytics
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[1]  # Trỏ ngược 1 cấp (từ /scripts -> /STN_Final_Term)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# ==================== KẾT THÚC THÊM CODE ====================
 import argparse, sys
 from pathlib import Path
 from types import SimpleNamespace

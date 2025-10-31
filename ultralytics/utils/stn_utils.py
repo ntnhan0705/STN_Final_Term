@@ -200,59 +200,64 @@ class STNControl(_Ctx):
             self._patch_blend(m, alpha)
 
     def on_train_epoch_start(self, trainer):
-        model = self.root(trainer)
-        # --- THÊM DÒNG NÀY ---
-        ema_model = getattr(getattr(trainer, "ema", None), "ema", None)
-        # --- KẾT THÚC THÊM ---
+        model = self.root(trainer)  # self.root() trả về trainer.model.model (đúng)
+
+        # --- SỬA LẠI LOGIC TÌM EMA MODEL ---
+        ema_model_raw = getattr(getattr(trainer, "ema", None), "ema", None)
+        ema_model_seq = getattr(ema_model_raw, "model", None)  # Lấy .model (nn.Sequential) từ bên trong EMA
+        # --- KẾT THÚC SỬA ---
+
         if model is None:
             return
         e = int(getattr(trainer, "epoch", 0))
         self._epoch = e
         if e < self.freeze_epochs:
             self._apply_identity(model, True)
-            if ema_model: self._apply_identity(ema_model, True)  # --- THÊM DÒNG NÀY ---
+            if ema_model_seq: self._apply_identity(ema_model_seq, True)  # <-- Dùng ema_model_seq
             self._mode, self._alpha = "identity", 0.0
             if self.log:
                 LOGGER.info(f"[STN] identity @ epoch {e}")
         else:
             a = self._alpha_for(e)
             self._apply_identity(model, False)
-            if ema_model: self._apply_identity(ema_model, False)  # --- THÊM DÒNG NÀY ---
+            if ema_model_seq: self._apply_identity(ema_model_seq, False)  # <-- Dùng ema_model_seq
             self._apply_blend(model, a)
-            if ema_model: self._apply_blend(ema_model, a)  # --- THÊM DÒNG NÀY ---
+            if ema_model_seq: self._apply_blend(ema_model_seq, a)  # <-- Dùng ema_model_seq
             self._mode, self._alpha = "blend", a
             if self.log:
                 LOGGER.info(f"[STN] blend α={a:.3f} (t≤{self.tmax:.2f}, s∈[{self.smin:.2f},{self.smax:.2f}])")
 
-        # stn_utils.py
-
     def on_val_start(self, validator):
-        m = self.root(validator)
-        # --- THÊM 2 DÒNG NÀY ---
-        ema_m = getattr(getattr(validator, "trainer", None), "ema", None)
-        ema_model = getattr(ema_m, "ema", None)
-        # --- KẾT THÚC THÊM ---
+        m = self.root(validator)  # self.root() trả về trainer.model.model (đúng)
+
+        # --- SỬA LẠI LOGIC TÌM EMA MODEL ---
+        ema_m_raw = getattr(getattr(validator, "trainer", None), "ema", None)
+        ema_model_raw = getattr(ema_m_raw, "ema", None)
+        ema_model_seq = getattr(ema_model_raw, "model", None)  # Lấy .model (nn.Sequential) từ bên trong EMA
+        # --- KẾT THÚC SỬA ---
+
         if m is not None:
             self._apply_identity(m, True)
-        if ema_model is not None: self._apply_identity(ema_model, True)  # --- THÊM DÒNG NÀY ---
+        if ema_model_seq is not None: self._apply_identity(ema_model_seq, True)  # <-- Dùng ema_model_seq
         if self.log:
             LOGGER.info("[STN] validation: identity")
 
-        # stn_utils.py
-
     def on_val_end(self, validator):
-        m = self.root(validator)
-        # --- THÊM 2 DÒNG NÀY ---
-        ema_m = getattr(getattr(validator, "trainer", None), "ema", None)
-        ema_model = getattr(ema_m, "ema", None)
-        # --- KẾT THÚC THÊM ---
+        m = self.root(validator) # self.root() trả về trainer.model.model (đúng)
+
+        # --- SỬA LẠI LOGIC TÌM EMA MODEL ---
+        ema_m_raw = getattr(getattr(validator, "trainer", None), "ema", None)
+        ema_model_raw = getattr(ema_m_raw, "ema", None)
+        ema_model_seq = getattr(ema_model_raw, "model", None) # Lấy .model (nn.Sequential) từ bên trong EMA
+        # --- KẾT THÚC SỬA ---
+
         if m is None:
             return
         if self._mode == "blend":
             self._apply_identity(m, False)
-            if ema_model: self._apply_identity(ema_model, False)  # --- THÊM DÒNG NÀY ---
+            if ema_model_seq: self._apply_identity(ema_model_seq, False) # <-- Dùng ema_model_seq
             self._apply_blend(m, self._alpha)
-            if ema_model: self._apply_blend(ema_model, self._alpha)  # --- THÊM DÒNG NÀY ---
+            if ema_model_seq: self._apply_blend(ema_model_seq, self._alpha) # <-- Dùng ema_model_seq
             if self.log:
                 LOGGER.info(f"[STN] restore blend α={self._alpha:.3f}")
 
