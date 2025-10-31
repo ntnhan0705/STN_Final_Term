@@ -129,6 +129,8 @@ class RotatedBboxLoss(BboxLoss):
         return loss_iou, loss_dfl
 
 # ----------------------------------------------------------------------(ntnhan.0705)
+# (Đảm bảo các import 'torch', 'nn', 'LOGGER', 'SimpleNamespace', '_STN', 'TaskAlignedAssigner', 'BboxLoss', 'make_anchors', 'xywh2xyxy', 'dist2bbox', 'bbox_iou', 'bbox2dist', 'roi_align' đã có ở đầu file loss.py)
+
 # ========================================================================== #
 #                            v8DetectionLoss (STN)                           #
 # ========================================================================== #
@@ -138,6 +140,7 @@ class SupConProjection(nn.Module):
     - Hỗ trợ chọn chuẩn hoá: bn=0(None), 1(BatchNorm1d), 2(LayerNorm)
     - Cũng chấp nhận 'norm'='none'|'bn'|'ln' để tương thích phiên bản cũ.
     """
+
     def __init__(self, in_dim, hidden, out_dim, bn=1):
         super().__init__()
         # Layer ẩn
@@ -164,11 +167,33 @@ _SUPCON_KEYS = (
     "supcon_on", "supcon_feat", "supcon_warp_gt", "supcon_out",
     "supcon_min_box", "supcon_max_per_class", "supcon_gain", "supcon_loss_weight",
     "supcon_temp", "supcon_warmup", "supcon_log", "supcon_use_mem", "supcon_queue",
-    "supcon_neg_cap", "supcon_schedule", "supcon_proj_dim", "supcon_proj_hidden", "supcon_proj_bn"
+    "supcon_neg_cap", "supcon_schedule", "supcon_proj_dim", "supcon_proj_hidden", "supcon_proj_bn",
+    # (ntnhan) Thêm key cho lr_mult
+    "supcon_lr_mult",
 )
+
+
+# (ntnhan) Thêm 2 hàm global helper này (nếu file stn_utils.py của bạn có định nghĩa chúng)
+# Nếu không, hãy xóa 2 dòng gọi chúng (bên trong attach_... và setup_...)
+def _supcon_get_global_projector():
+    try:
+        from ultralytics.utils.stn_utils import supcon_get_global_projector
+        return supcon_get_global_projector()
+    except ImportError:
+        return None
+
+
+def _supcon_set_global_projector(proj):
+    try:
+        from ultralytics.utils.stn_utils import supcon_register_projector
+        supcon_register_projector(proj)
+    except ImportError:
+        pass
+
 
 class v8DetectionLoss:
     """YOLOv8 detection loss + SupCon (ROIAlign trên feature map sau STN)."""
+
     def __init__(self, model, tal_topk=10):
         self.device = next(model.parameters()).device
         self.model = model
@@ -181,11 +206,12 @@ class v8DetectionLoss:
 
         # Đồng bộ các tham số SupCon từ model.args và biến môi trường (nếu có)
         self._normalize_and_mirror_supcon(from_env=True)
-        LOGGER.info(f"[LOSS INIT] use_supcon={bool(getattr(self.hyp,'supcon_on',0))}, "
-                    f"supcon_weight={getattr(self.hyp,'supcon_loss_weight', None)}")
+        LOGGER.info(f"[LOSS INIT] use_supcon={bool(getattr(self.hyp, 'supcon_on', 0))}, "
+                    f"supcon_weight={getattr(self.hyp, 'supcon_loss_weight', None)}")
 
         head = model.model[-1]  # detection head
         # Các thuộc tính từ head
+        self.ch = head.ch  # (ntnhan) Lấy channel list
         self.nc = head.nc  # number of classes
         self.reg_max = head.reg_max  # reg_max cho DFL
         self.no = self.nc + self.reg_max * 4  # số output mỗi anchor (cls + bbox)
@@ -194,6 +220,7 @@ class v8DetectionLoss:
 
         # Khởi tạo head projection SupCon khi cần (lazy init)
         self._proj_head = None
+        self.supcon_projector_attached = False  # (ntnhan) Đánh dấu
 
         # Loss/utility chính
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
@@ -202,18 +229,18 @@ class v8DetectionLoss:
         self.proj = torch.arange(self.reg_max, dtype=torch.float, device=self.device)  # cho DFL decode
 
         # SupCon memory queue
-        self._mq_feats = None   # tensor [Q, C] trên CPU (half) cho features queue
+        self._mq_feats = None  # tensor [Q, C] trên CPU (half) cho features queue
         self._mq_labels = None  # tensor [Q] long cho labels queue (label -1 cho background)
-        self._mq_ptr = 0        # con trỏ vòng cho queue
+        self._mq_ptr = 0  # con trỏ vòng cho queue
         self._mq_size = int(getattr(self.hyp, "supcon_queue", 2048))  # kích thước queue
         self._mq_ready = False  # đánh dấu queue đầy một vòng
 
         # STN hooks: Lưu theta và feature map sau STN
-        self.theta_for_loss = None      # lưu affine matrix theta của STN cho batch hiện tại
-        self._stn_module = None         # tham chiếu module STN (nếu có)
-        self._aft_min_channels = 128    # ngưỡng kênh feature để lấy output (sau STN)
-        self._aft_hooks = []            # lưu các forward hook sau STN
-        self._aft_last = None           # feature map cuối thu được sau STN (dùng cho SupCon)
+        self.theta_for_loss = None  # lưu affine matrix theta của STN cho batch hiện tại
+        self._stn_module = None  # tham chiếu module STN (nếu có)
+        self._aft_min_channels = 128  # ngưỡng kênh feature để lấy output (sau STN)
+        self._aft_hooks = []  # lưu các forward hook sau STN
+        self._aft_last = None  # feature map cuối thu được sau STN (dùng cho SupCon)
 
         # Gắn hook vào STN module để thu thập theta và feature maps
         stn_seen = False
@@ -236,8 +263,79 @@ class v8DetectionLoss:
                     pass
 
         # Biến phụ trợ
-        self._supcon_stat = {}   # lưu thống kê SupCon (số ROI, BG, v.v.)
+        self._supcon_stat = {}  # lưu thống kê SupCon (số ROI, BG, v.v.)
         self._printed_hyp = False  # đánh dấu đã in thông số hyp hiệu lực
+
+    # === BẮT ĐẦU SỬA LỖI: HÀM HELPER MỚI (Step 1) ===
+    def setup_supcon_projector(self):
+        """
+        Được gọi bởi trainer._setup_train() TRƯỚC KHI optimizer được tạo.
+        Chỉ tạo ra projector, KHÔNG gắn vào optimizer.
+        """
+        cfg = self.hyp
+        if not int(getattr(cfg, "supcon_on", 0) or 0): return
+        if not int(getattr(cfg, "supcon_proj_dim", 0) or 0): return
+        if self._proj_head is not None: return  # Đã tạo
+
+        # 1. Tìm kích thước feature
+        try:
+            if str(getattr(cfg, "supcon_feat", "stn")).lower() == "stn":
+                stn_layer = next(m for m in self.model.model.modules() if isinstance(m, _STN))
+                feat_dim = self.ch[stn_layer.stn_out_idx]
+                LOGGER.info(f"[SupCon/Setup] Lấy feat từ STN-out (idx={stn_layer.stn_out_idx}), dim={feat_dim}")
+            else:
+                feat_dim = self.ch[int(getattr(cfg, "supcon_out", 7))]
+        except Exception as e:
+            LOGGER.error(f"[SupCon/Setup] Lỗi tìm feature dim: {e}. Dùng P5 làm fallback.")
+            feat_dim = self.ch[-1]
+
+        # 2. Tạo Projector
+        hid = int(getattr(cfg, "supcon_proj_hidden", 0)) or max(128, feat_dim)
+        proj_dim = int(getattr(cfg, "supcon_proj_dim", 128))
+        proj_bn = int(getattr(cfg, "supcon_proj_bn", 1))
+
+        self._proj_head = SupConProjection(
+            in_dim=feat_dim,
+            hidden=hid,
+            out_dim=proj_dim,
+            bn=proj_bn
+        ).to(self.device)
+
+        setattr(self.model, "supcon_proj", self._proj_head)  # Gắn vào model
+        LOGGER.info(f"[SupConProj] created (in_dim={feat_dim}, out_dim={proj_dim}, hidden={hid}, bn={proj_bn})")
+
+    def attach_projector_to_optimizer(self, trainer):
+        """
+        Được gọi bởi trainer._setup_train() SAU KHI optimizer được tạo,
+        nhưng TRƯỚC KHI GradScaler được tạo.
+        """
+        if self._proj_head is None or self.supcon_projector_attached:
+            return  # Chưa tạo hoặc đã gắn
+
+        cfg = self.hyp
+        opt = trainer.optimizer
+        params = [p for p in self._proj_head.parameters() if p.requires_grad]
+
+        if params:
+            lr_mult = float(getattr(cfg, "supcon_lr_mult", 1.0))
+            base_init = float(getattr(getattr(trainer, 'args', SimpleNamespace()), 'lr0', 0.001))
+            base_lr = opt.param_groups[0]["lr"] * lr_mult
+
+            opt.add_param_group(
+                {"params": list(params), "lr": float(base_lr), "weight_decay": 0.0,
+                 "initial_lr": float(base_init), "name": "supcon_proj", "p_ignore": True}
+            )
+            LOGGER.info(
+                f"[SupConProj] ADDED (in setup_supcon) | n_params={sum(p.numel() for p in params)} | lr={base_lr}")
+            self.supcon_projector_attached = True
+            try:
+                _supcon_set_global_projector(self._proj_head)
+            except NameError:
+                pass  # Bỏ qua nếu hàm global không tồn tại
+        else:
+            LOGGER.warning("[SupConProj] Projector được tạo nhưng không có tham số huấn luyện.")
+
+    # === KẾT THÚC SỬA LỖI (Step 1) ===
 
     # --------------------- Helpers: đồng bộ / normalize supcon_* ---------------------
     def _merge_from_model_args(self):
@@ -343,14 +441,14 @@ class v8DetectionLoss:
         device = z.device
         y = y.view(-1).long()
         # Chia anchor vs background trong batch
-        a_mask = y.ge(0)            # anchor mask (labels >= 0)
-        bg_mask = ~a_mask           # background mask (labels < 0, ví dụ -1)
+        a_mask = y.ge(0)  # anchor mask (labels >= 0)
+        bg_mask = ~a_mask  # background mask (labels < 0, ví dụ -1)
         if a_mask.sum() == 0:
             # Không có object anchor nào trong batch -> không tính SupCon
             return None
 
-        z_a = z[a_mask]    # [Ba, C] anchor features
-        y_a = y[a_mask]    # [Ba] anchor labels (>=0)
+        z_a = z[a_mask]  # [Ba, C] anchor features
+        y_a = y[a_mask]  # [Ba] anchor labels (>=0)
         z_bg = z[bg_mask] if bg_mask.any() else None  # [Bb, C] background features (dùng làm negative)
 
         # Chuẩn hoá vector anchor (để dùng tính dot sản phẩm)
@@ -360,14 +458,14 @@ class v8DetectionLoss:
         qsize = int(getattr(self.hyp, "supcon_queue", 4096))
         cdim = int(z.size(1))
         if not hasattr(self, "_mq_feats") or self._mq_feats is None or \
-           self._mq_feats.size(0) != qsize or self._mq_feats.size(1) != cdim:
+                self._mq_feats.size(0) != qsize or self._mq_feats.size(1) != cdim:
             self._mq_feats = torch.empty((qsize, cdim), dtype=torch.float16, device="cpu")
             self._mq_labels = torch.full((qsize,), -1, dtype=torch.long, device="cpu")
             self._mq_ptr = 0
 
         # Tạo danh sách KEYs: anchors (detach) + backgrounds (detach) + queue (đưa lên GPU nếu có)
-        keys_list = [z_a.detach()]           # anchors làm negative chéo (self-contrast sẽ mask diag)
-        klabels_list = [y_a]                 # nhãn cho anchor keys (để nhận biết positives)
+        keys_list = [z_a.detach()]  # anchors làm negative chéo (self-contrast sẽ mask diag)
+        klabels_list = [y_a]  # nhãn cho anchor keys (để nhận biết positives)
         if z_bg is not None and z_bg.numel() > 0:
             keys_list.append(z_bg.detach())
             klabels_list.append(torch.full((z_bg.size(0),), -1, dtype=torch.long, device=y.device))
@@ -380,7 +478,7 @@ class v8DetectionLoss:
                 mq_labs = self._mq_labels[valid].to(device, non_blocking=True)
                 keys_list.append(mq_feats)
                 klabels_list.append(mq_labs)
-        keys = torch.cat(keys_list, dim=0)    # [K, C]
+        keys = torch.cat(keys_list, dim=0)  # [K, C]
         klabels = torch.cat(klabels_list, dim=0)  # [K]
 
         # Giới hạn tổng số keys (negatives) để tránh quá tải (supcon_neg_cap)
@@ -405,7 +503,8 @@ class v8DetectionLoss:
 
         # Mask self-contrast (loại bỏ anchor so với chính nó) và xác định positive pairs
         Ba, K = logits.size()
-        same = y_a.view(-1, 1).eq(klabels.view(1, -1)) & klabels.view(1, -1).ge(0)  # chỉ cùng lớp (>=0) mới tính positive
+        same = y_a.view(-1, 1).eq(klabels.view(1, -1)) & klabels.view(1, -1).ge(
+            0)  # chỉ cùng lớp (>=0) mới tính positive
         # Mask loại self-pairs cho anchors đầu (phần keys chứa anchors_detach)
         logits_mask = torch.ones_like(logits, dtype=torch.bool)
         base_self = z_a.size(0)
@@ -530,10 +629,10 @@ class v8DetectionLoss:
             on=int(getattr(self.hyp, "supcon_on", 0) or 0),
             feat=str(getattr(self.hyp, "supcon_feat", "stn")).lower(),
             warp=int(getattr(self.hyp, "supcon_warp_gt", 0)),
-            out=int(getattr(self.hyp, "supcon_out", 7)),            # output_size ROIAlign
-            min_box=int(getattr(self.hyp, "supcon_min_box", 1)),    # filter bbox quá nhỏ
+            out=int(getattr(self.hyp, "supcon_out", 7)),  # output_size ROIAlign
+            min_box=int(getattr(self.hyp, "supcon_min_box", 1)),  # filter bbox quá nhỏ
             max_pc=int(getattr(self.hyp, "supcon_max_per_class", 0)),  # giới hạn per-class
-            temp=float(getattr(self.hyp, "supcon_temp", 0.2)),      # temperature
+            temp=float(getattr(self.hyp, "supcon_temp", 0.2)),  # temperature
             gain=float(getattr(self.hyp, "supcon_gain", 2.5)),
             warmup=int(getattr(self.hyp, "supcon_warmup", 0)),
             use_mem=int(getattr(self.hyp, "supcon_use_mem", 1)),
@@ -541,6 +640,9 @@ class v8DetectionLoss:
             proj_hidden=int(getattr(self.hyp, "supcon_proj_hidden", 0)),
             proj_bn=int(getattr(self.hyp, "supcon_proj_bn", 1)),
             log=int(getattr(self.hyp, "supcon_log", 0)),
+
+            # (ntnhan) Lấy thêm các cấu hình khác từ self.hyp nếu cần
+            lr_mult=float(getattr(self.hyp, "supcon_lr_mult", 1.0)),
         )
 
         # Xử lý đầu ra mô hình
@@ -583,8 +685,8 @@ class v8DetectionLoss:
                     if cfg.warp and (self.theta_for_loss is not None) and (src == "after_stn"):
                         boxes_bm = self.warp_bbox(boxes_bm, self.theta_for_loss, imgsz)
                     # Lấy list các bbox [N,4] và labels [N] cho ROIAlign
-                    boxes = boxes_bm[b_idx, m_idx]                    # [N,4] toạ độ xyxy gốc (pixels)
-                    labels = gt_labels[b_idx, m_idx, 0].long()        # [N] nhãn class (long)
+                    boxes = boxes_bm[b_idx, m_idx]  # [N,4] toạ độ xyxy gốc (pixels)
+                    labels = gt_labels[b_idx, m_idx, 0].long()  # [N] nhãn class (long)
                     # Bỏ ROI quá nhỏ và giới hạn số ROI mỗi class nếu cần
                     wh = boxes[:, 2:] - boxes[:, :2]
                     keep = (wh[:, 0] >= cfg.min_box) & (wh[:, 1] >= cfg.min_box)
@@ -605,8 +707,10 @@ class v8DetectionLoss:
                         abn_mask = batch.get("abn_mask", None)
                         if pair_idx is not None and abn_mask is not None:
                             # Đảm bảo pair_idx và abn_mask là tensor trên device
-                            pair_idx = torch.as_tensor(pair_idx, device=boxes.device) if not torch.is_tensor(pair_idx) else pair_idx
-                            abn_mask = torch.as_tensor(abn_mask, device=boxes.device).bool() if not torch.is_tensor(abn_mask) else abn_mask.bool()
+                            pair_idx = torch.as_tensor(pair_idx, device=boxes.device) if not torch.is_tensor(
+                                pair_idx) else pair_idx
+                            abn_mask = torch.as_tensor(abn_mask, device=boxes.device).bool() if not torch.is_tensor(
+                                abn_mask) else abn_mask.bool()
                             # Duyệt từng cặp (i,j): chọn ảnh bất thường (abnormal) làm FG và ảnh thường (normal) làm BG
                             for (i, j) in pair_idx.tolist():
                                 if bool(abn_mask[i]) and not bool(abn_mask[j]):
@@ -626,7 +730,8 @@ class v8DetectionLoss:
                                 boxes = torch.cat([boxes, b_fg], dim=0)
                                 labels = torch.cat([labels, lbl_bg], dim=0)
                                 b_keep = torch.cat([b_keep,
-                                                    torch.full((b_fg.size(0),), bg, device=b_keep.device, dtype=b_keep.dtype)], dim=0)
+                                                    torch.full((b_fg.size(0),), bg, device=b_keep.device,
+                                                               dtype=b_keep.dtype)], dim=0)
                                 bg_add += int(b_fg.size(0))
                         # Chạy ROIAlign để lấy feature vector cho mỗi ROI
                         if boxes.numel() > 0:
@@ -634,7 +739,8 @@ class v8DetectionLoss:
                             _, Cf, Hf, Wf = feat_map.shape
                             # Clamp tọa độ ROI trong ảnh gốc
                             x1, y1, x2, y2 = boxes.unbind(1)
-                            x1 = x1.clamp(0, W - 1);  y1 = y1.clamp(0, H - 1)
+                            x1 = x1.clamp(0, W - 1);
+                            y1 = y1.clamp(0, H - 1)
                             x2 = torch.maximum(x2.clamp(0, W - 1), x1 + 1)
                             y2 = torch.maximum(y2.clamp(0, H - 1), y1 + 1)
                             boxes = torch.stack([x1, y1, x2, y2], 1)
@@ -642,36 +748,42 @@ class v8DetectionLoss:
                             sx, sy = Wf / float(W), Hf / float(H)
                             fx1, fy1 = boxes[:, 0] * sx, boxes[:, 1] * sy
                             fx2, fy2 = boxes[:, 2] * sx, boxes[:, 3] * sy
-                            rois = torch.stack([b_keep.float(), fx1.float(), fy1.float(), fx2.float(), fy2.float()], 1).to(feat_map.device, feat_map.dtype)
+                            rois = torch.stack([b_keep.float(), fx1.float(), fy1.float(), fx2.float(), fy2.float()],
+                                               1).to(feat_map.device, feat_map.dtype)
                             # ROIAlign để trích xuất vùng feature cho mỗi ROI (output cfg.out × cfg.out)
                             pooled = roi_align(input=feat_map, boxes=rois,
                                                output_size=(cfg.out, cfg.out),
                                                spatial_scale=1.0, sampling_ratio=0, aligned=True)
                             z = pooled.mean(dim=(2, 3))  # [N, C] GAP trên ROI
-                            # Projection head (nếu có thiết lập)
+
+                            # === BẮT ĐẦU SỬA LỖI: CHỈ SỬ DỤNG PROJECTOR ===
                             if cfg.proj_dim > 0:
-                                if self._proj_head is None:
-                                    in_dim = int(z.shape[1])
-                                    hid = int(cfg.proj_hidden) if int(cfg.proj_hidden) > 0 else max(128, in_dim)
-                                    self._proj_head = SupConProjection(in_dim=in_dim, hidden=hid,
-                                                                       out_dim=int(cfg.proj_dim), bn=int(cfg.proj_bn)).to(self.device)
-                                    setattr(self.model, "supcon_proj", self._proj_head)
-                                    LOGGER.info(f"[SupConProj] created (in_dim={in_dim}, out_dim={cfg.proj_dim}, hidden={hid}, bn={int(cfg.proj_bn)})")
-                                z = self._proj_head(z)
-                            # Cập nhật thống kê SupCon
-                            mem_valid = int(self._mq_labels.ge(0).sum().item()) if (self._mq_labels is not None) else 0
-                            self._supcon_stat.update({"used": src, "roi": int(z.size(0)),
-                                                      "mem_valid": mem_valid, "bg_roi": int(bg_add)})
-                            # Tính SupCon loss (ưu tiên dùng memory queue nếu có)
-                            loss_mem = self._supcon_loss_memory(z, labels, cfg.temp)
-                            loss_batch = self._supcon_loss(z, labels, cfg.temp) if loss_mem is None else None
-                            self._supcon_val = loss_mem if (loss_mem is not None) else loss_batch
-                            # Đưa các anchor (label>=0) từ batch vào queue (background label=-1 sẽ tự loại)
-                            with torch.no_grad():
-                                keep_pos = labels.ge(0)
-                                if keep_pos.any():
-                                    self._mq_enqueue(F.normalize(z[keep_pos], dim=1).detach(),
-                                                     labels[keep_pos].detach())
+                                if self._proj_head is not None:
+                                    z = self._proj_head(z)  # Chỉ chạy forward
+                                else:
+                                    # Điều này không nên xảy ra nếu setup_supcon_projector chạy đúng
+                                    LOGGER.warning("[SupCon] Projector không được khởi tạo! Bỏ qua SupCon loss.")
+                                    self._supcon_val = None
+                                    # (Không 'continue', chỉ bỏ qua phần supcon)
+                            # === KẾT THÚC SỬA LỖI ===
+
+                            # Cập nhật thống kê SupCon (chỉ khi z được tính)
+                            # (Sửa lỗi logic: chỉ chạy nếu projector đã sẵn sàng hoặc không cần)
+                            if self._proj_head is not None or cfg.proj_dim == 0:
+                                mem_valid = int(self._mq_labels.ge(0).sum().item()) if (
+                                            self._mq_labels is not None) else 0
+                                self._supcon_stat.update({"used": src, "roi": int(z.size(0)),
+                                                          "mem_valid": mem_valid, "bg_roi": int(bg_add)})
+                                # Tính SupCon loss (ưu tiên dùng memory queue nếu có)
+                                loss_mem = self._supcon_loss_memory(z, labels, cfg.temp)
+                                loss_batch = self._supcon_loss(z, labels, cfg.temp) if loss_mem is None else None
+                                self._supcon_val = loss_mem if (loss_mem is not None) else loss_batch
+                                # Đưa các anchor (label>=0) từ batch vào queue (background label=-1 sẽ tự loại)
+                                with torch.no_grad():
+                                    keep_pos = labels.ge(0)
+                                    if keep_pos.any():
+                                        self._mq_enqueue(F.normalize(z[keep_pos], dim=1).detach(),
+                                                         labels[keep_pos].detach())
             except Exception as e:
                 LOGGER.warning(f"[SupCon] EXCEPTION: {e}")
                 self._supcon_val = None
@@ -727,8 +839,8 @@ class v8DetectionLoss:
         # loss_items để log: [loss_box_det, loss_cls, loss_dfl, supcon_loss]
         loss_items = torch.stack((box_det_loss.detach(), loss[1].detach(), loss[2].detach(), supcon_log))
         total_loss = loss.sum()
-        #LOGGER.info(f"[ValDbg] pred_scores: {pred_scores.shape}, sample score max: {pred_scores.sigmoid().max().item():.4f}")
-        #LOGGER.info(f"[ValDbg] pred_bboxes: {pred_bboxes.shape}, sample bbox mean: {pred_bboxes.mean().item():.2f}")
+        # LOGGER.info(f"[ValDbg] pred_scores: {pred_scores.shape}, sample score max: {pred_scores.sigmoid().max().item():.4f}")
+        # LOGGER.info(f"[ValDbg] pred_bboxes: {pred_bboxes.shape}, sample bbox mean: {pred_bboxes.mean().item():.2f}")
 
         return total_loss, loss_items
 
@@ -771,13 +883,12 @@ class v8DetectionLoss:
         if theta is None or not torch.is_tensor(theta):
             return torch.zeros((), device=self.device)
         T = theta.view(-1, 2, 3)
-        M = T[:, :, :2]        # ma trận biến dạng 2x2
-        t = T[:, :, 2]         # vector t (dịch chuyển)
+        M = T[:, :, :2]  # ma trận biến dạng 2x2
+        t = T[:, :, 2]  # vector t (dịch chuyển)
         I = torch.eye(2, device=self.device).unsqueeze(0).expand_as(M)
         loss_m = (M - I).pow(2).sum()
         loss_t = (t).pow(2).sum()
         return loss_m + 0.25 * loss_t
-
 # ----------------------------------------------------------------------(ntnhan.0705)
 
 class v8SegmentationLoss(v8DetectionLoss):

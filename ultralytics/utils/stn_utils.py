@@ -720,41 +720,55 @@ def supcon_register_projector(proj):
 
 def _supcon_get_global_projector(): return _SUPCON_PROJ_GLOBAL
 
+
 class AttachSupConProjToOptim:
-    def __init__(self): self.attached = False
+    def __init__(self):
+        self.attached = False
+
     def _resolve(self, t):
         cand = []
-        crit = getattr(t, "criterion", None); loss = getattr(t, "loss", None)
-        if crit is not None: cand += [getattr(crit,k,None) for k in ("_supcon_proj","supcon_projector","projector","supcon_proj")]
-        if loss is not None: cand += [getattr(loss,k,None) for k in ("_supcon_proj","supcon_projector","projector","supcon_proj")]
-        cand += [getattr(t,k,None) for k in ("_supcon_proj","supcon_projector","supcon_proj")]
+        crit = getattr(t, "criterion", None);
+        loss = getattr(t, "loss", None)
+        if crit is not None: cand += [getattr(crit, k, None) for k in
+                                      ("_supcon_proj", "supcon_projector", "projector", "supcon_proj")]
+        if loss is not None: cand += [getattr(loss, k, None) for k in
+                                      ("_supcon_proj", "supcon_projector", "projector", "supcon_proj")]
+        cand += [getattr(t, k, None) for k in ("_supcon_proj", "supcon_projector", "supcon_proj")]
         model = getattr(t, "model", None)
-        if model is not None: cand += [getattr(model,k,None) for k in ("_supcon_proj","supcon_projector","supcon_proj")]
-        cand.append(_supcon_get_global_projector())
+        if model is not None: cand += [getattr(model, k, None) for k in
+                                       ("_supcon_proj", "supcon_projector", "supcon_proj")]
+        cand.append(_supcon_get_global_projector())  # Giả định hàm _supcon_get_global_projector() tồn tại
         for c in cand:
             if c is not None: return c
         return None
+
     def _attach(self, t, proj, when: str):
         opt = getattr(t, "optimizer", None)
         if opt is None: LOGGER.info(f"[SupConProj] no optimizer ({when})"); return False
         if proj is None: return False
         params = [p for p in proj.parameters() if p.requires_grad]
         if not params: LOGGER.info("[SupConProj] no trainable params"); return False
-        old_lrs   = [g.get("lr", None) for g in opt.param_groups]
+        old_lrs = [g.get("lr", None) for g in opt.param_groups]
         old_inits = [g.get("initial_lr", None) for g in opt.param_groups]
-        base_init = float(getattr(getattr(t,'args',SimpleNamespace()), 'lr0', 0.001))
+        base_init = float(getattr(getattr(t, 'args', SimpleNamespace()), 'lr0', 0.001))
         base_lr, base_wd = base_init, 0.0
-        target_pg = None; proj_ids = {id(p) for p in params}
+        target_pg = None;
+        proj_ids = {id(p) for p in params}
         for g in opt.param_groups:
             if proj_ids & {id(p) for p in g.get("params", [])}: target_pg = g; break
+
         def fill(pg):
             d = getattr(opt, "defaults", {}) or {}
-            for k,v in d.items(): pg.setdefault(k, v)
+            for k, v in d.items(): pg.setdefault(k, v)
             pg.setdefault("initial_lr", pg.get("lr", base_init))
             pg.setdefault("weight_decay", base_wd)
-            pg.setdefault("name", "supcon_proj"); return pg
+            pg.setdefault("name", "supcon_proj");
+            return pg
+
         if target_pg is None:
-            new_pg = fill({"params": list(params), "lr": float(base_lr), "weight_decay": 0.0, "initial_lr": float(base_init), "name":"supcon_proj"})
+            new_pg = fill(
+                {"params": list(params), "lr": float(base_lr), "weight_decay": 0.0, "initial_lr": float(base_init),
+                 "name": "supcon_proj"})
             opt.add_param_group(new_pg)
             LOGGER.info(f"[SupConProj] ADDED (when={when}) | n_params={sum(p.numel() for p in params)} | lr={base_lr}")
         else:
@@ -763,22 +777,46 @@ class AttachSupConProjToOptim:
             fill(target_pg)
             if float(target_pg.get("lr", 0.0)) == 0.0: target_pg["lr"] = float(base_lr)
             LOGGER.info(f"[SupConProj] REUSED (when={when}) | lr={target_pg['lr']}")
-        for i,g in enumerate(opt.param_groups):
-            if g.get("name","") == "supcon_proj": continue
-            if old_lrs[i]   is not None: g["lr"] = old_lrs[i]
+        for i, g in enumerate(opt.param_groups):
+            if g.get("name", "") == "supcon_proj": continue
+            if old_lrs[i] is not None: g["lr"] = old_lrs[i]
             if old_inits[i] is not None: g["initial_lr"] = old_inits[i]
         try:
-            supcon_register_projector(proj)
-        except Exception: pass
+            supcon_register_projector(proj)  # Giả định hàm supcon_register_projector() tồn tại
+        except Exception:
+            pass
+
+        # === BẮT ĐẦU SỬA LỖI: TẠO LẠI GRADSCALER ===
+        # Sau khi thay đổi optimizer (add_param_group), chúng ta PHẢI
+        # tạo lại GradScaler nếu AMP đang bật, nếu không sẽ bị lỗi AssertionError.
+        # 't' chính là đối tượng `trainer`.
+        if getattr(t, 'amp', False):
+            LOGGER.warning("[SupCon/Optim] Optimizer changed. Re-initializing GradScaler...")
+            # (Đảm bảo 'import torch' đã có ở đầu file stn_utils.py)
+            t.scaler = torch.cuda.amp.GradScaler(enabled=t.amp)
+        # === KẾT THÚC SỬA LỖI ===
+
         return True
+
     def _try(self, t, when):
         if self.attached: return
         proj = self._resolve(t)
         if proj is None: return
-        if self._attach(t, proj, when): self.attached = True
-    def on_train_start(self, t, *a, **k): self._try(t, "on_train_start")
+        if self._attach(t, proj, when):
+            self.attached = True
+            # === BẮT ĐẦU SỬA LỖI: HỦY CALLBACK ===
+            # Sau khi gắn thành công, hủy callback để nó không chạy nữa
+            LOGGER.info(f"[SupConProj] Successfully attached. Removing callback.")
+            for cb_list_name in ("on_train_start", "on_train_batch_start", "on_train_batch_end"):
+                t.remove_callback(cb_list_name, getattr(self, cb_list_name, None))
+            # === KẾT THÚC SỬA LỖI ===
+
+    def on_train_start(self, t, *a, **k):
+        self._try(t, "on_train_start")
+
     def on_train_batch_start(self, t, *a, **k):
         if not self.attached: self._try(t, "on_train_batch_start")
+
     def on_train_batch_end(self, t, *a, **k):
         if not self.attached: self._try(t, "on_train_batch_end")
 

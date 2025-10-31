@@ -188,197 +188,161 @@ class Detect(nn.Module):
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
 
 # -------------------------------------------------------------------- (ntnhan.0705)
+@smart_inference_mode()
 def _invert_affine(theta: Tensor) -> Tensor:
-    """Đảo batch affine 2×3 (B,2,3) ⇒ (B,2,3). Đảm bảo hoạt động với float32."""
+    """Đảo batch affine 2×3 (B,2,3) ⇒ (B,2,3)."""
     B = theta.size(0)
-    if B == 0:
-        return torch.empty((0, 2, 3), device=theta.device, dtype=torch.float32)
-
-    # Bọc toàn bộ trong autocast(float32)
-    with autocast(device_type=theta.device.type, dtype=torch.float32):
-        theta_float = theta.float()  # Đảm bảo input là float32
-
-        bottom = torch.tensor([[0.0, 0.0, 1.0]], device=theta_float.device, dtype=torch.float32).expand(B, -1, -1)
-        full = torch.cat([theta_float, bottom], dim=1)
-
-        try:
-            inv = torch.linalg.inv(full)[:, :2]
-        except Exception as e:
-            LOGGER.error(f"Error during torch.linalg.inv: {e}. Input shape: {full.shape}, dtype: {full.dtype}")
-            inv = torch.tensor([[1., 0., 0.], [0., 1., 0.]], device=theta_float.device, dtype=torch.float32).expand(B,-1,-1)
-    return inv  # Trả về float32
+    # ghép hàng [0 0 1] ➜ 3×3, rồi inverse
+    bottom = theta.new_tensor([0.0, 0.0, 1.0]).view(1, 1, 3).expand(B, 1, 3)
+    full   = torch.cat([theta, bottom], dim=1)              # (B,3,3)
+    try:
+        inv    = torch.inverse(full)[:, :2]                     # (B,2,3)
+    except Exception:
+        # Fallback nếu ma trận suy biến
+        LOGGER.warning("[DetectSDTN] Lỗi torch.inverse(theta), dùng ma trận identity fallback.")
+        inv = torch.tensor([[1., 0., 0.], [0., 1., 0.]],
+                           device=theta.device, dtype=theta.dtype).unsqueeze(0).expand(B, -1, -1)
+    return inv
 
 class DetectSDTN(Detect):
     """
-    Detect head + Spatial **De**-Transformer.
-    Khi STN bật, head tự “gỡ xoắn” feature-map bằng θ-¹ nên bbox trả
-    về vẫn nằm trên hệ toạ độ ảnh gốc.
+    Detect head + Spatial De-Transformer (cho bboxes).
+    Đầu head này KHÔNG de-warp feature maps.
+    Nó dự đoán bboxes trong *warped space*.
+    Sau đó, nó dùng theta nghịch đảo để de-warp các bboxes về *original space*.
     """
 
     def __init__(self, nc=80, ch=()):
         super().__init__(nc, ch)
         self._stn: SpatialTransformer | None = None  # tìm lười biếng
         self.active = True  # callback ngoài có thể tắt
-        # <<< THÊM BIẾN ĐẾM RIÊNG BIỆT >>>
-        self._train_log_counter = 0
-        self._val_log_counter = 0
-        self._log_interval = 500  # Interval cho training
-        self._val_log_interval = 50  # Interval cho validation
-        # <<< KẾT THÚC THÊM BIẾN >>>
+        self.xyxy = True  # <-- QUAN TRỌNG: ÉP BUỘC OUTPUT TỪ _inference() LÀ XYXY
 
-    # ---------------- private helpers -----------------
+        # Thêm một buffer rỗng để lưu `theta_inv`
+        self.register_buffer("theta_inv_buffer", torch.empty(0), persistent=False)
+
     def _lazy_find_stn(self):
-        """Tìm STN duy nhất từ global registry; nếu không có thì sinh θ = identity."""
-        if self._stn is None:  # Chỉ chạy 1 lần
-
-            # 1) Cố tìm SpatialTransformer thật từ GLOBAL REGISTRY
-            # (STN phải được import từ .block)
+        """Tìm STN duy nhất từ global registry."""
+        if self._stn is None:
             if hasattr(SpatialTransformer, "registry") and SpatialTransformer.registry:
-                self._stn = SpatialTransformer.registry[0]  # Lấy STN đầu tiên tìm thấy
+                self._stn = SpatialTransformer.registry[0]
                 try:
                     LOGGER.info(f"[DetectSDTN] Found STN via global registry: {type(self._stn).__name__}")
                 except Exception:
                     pass
             else:
-                self._stn = None  # Không tìm thấy
-
-            # 2) Nếu không có, tạo “STN giả” chỉ chứa θ = I_2×3
-            if self._stn is None:
+                self._stn = None
                 try:
-                    LOGGER.warning("[DetectSDTN] No STN in registry. Creating FAKE identity STN.")
+                    LOGGER.warning("[DetectSDTN] No STN in registry. De-warping bboxes sẽ bị tắt.")
                 except Exception:
                     pass
-
-                # Tạo một object "giả" có thuộc tính .theta
-                # Dùng nn.Module làm object rỗng để nó tương thích với .to(device)
-                self._stn_fake_wrapper = nn.Module()
-                theta_identity = torch.tensor([[1., 0., 0.],
-                                               [0., 1., 0.]], dtype=torch.float32)
-
-                # Dùng register_buffer để nó tự di chuyển theo model.to(device)
-                self._stn_fake_wrapper.register_buffer("theta", theta_identity.unsqueeze(0), persistent=False)
-                # Gán self._stn bằng object "giả" này
-                self._stn = self._stn_fake_wrapper
-
         return self._stn
 
-    @staticmethod
-    def _dewarp_feats(
-            feats: list[Tensor] | tuple[Tensor, ...],
-            theta_inv: Tensor  # theta_inv từ _invert_affine đã là float32
-    ) -> list[Tensor]:
-        """Affine-grid + grid-sample cho từng feature‐map. Đảm bảo chạy ở float32."""
-        out = []
-        # Ép các phép toán hình học này chạy ở float32
-        with autocast(device_type=theta_inv.device.type, dtype=torch.float32):
-            for f in feats:  # f có thể là float16
-                B, C, H, W = f.shape
-                # Chuyển feature map sang float32 *nếu chưa phải*
-                f_float = f.float() if f.dtype != torch.float32 else f
-
-                # affine_grid yêu cầu theta float32 (theta_inv đã là float32)
-                grid = F.affine_grid(theta_inv, (B, C, H, W), align_corners=False)  # grid là float32
-
-                warped_float = F.grid_sample(
-                    f_float, grid,
-                    mode="bilinear", padding_mode="zeros",
-                    align_corners=False
-                )
-
-                # Chuyển kết quả về dtype gốc của feature map
-                out.append(warped_float.to(f.dtype))
-        return out
-
-    # ---------------- forward -------------------------
+    @smart_inference_mode()
     def forward(self, x):
         """
-        x: list feature P3, P4, P5.
-        Nếu self.active=False ➜ bỏ qua de-warp.
+        x: list feature P3, P4, P5 (đã bị warp bởi STN layer 1).
         """
-        # --- Logging Counter & Interval Check ---
+
+        # 1. Chạy forward của Detect gốc (KHÔNG de-warp features)
+        # super().forward() sẽ gọi self._inference()
+        # self._inference() sẽ gọi self.decode_bboxes()
+        # Vì self.xyxy = True, self.decode_bboxes() sẽ trả về (B, 4, N) ở dạng XYXY
+        output = super().forward(x)
+
+        # 2. Nếu đang training, chỉ trả về features (đã bị warp)
         if self.training:
-            if not hasattr(self, '_train_log_counter'): self._train_log_counter = 0
-            self._train_log_counter += 1
-            current_counter = self._train_log_counter
-            log_interval = getattr(self, '_log_interval', 500)
-        else:  # Validation hoặc Prediction
-            if not hasattr(self, '_val_log_counter'): self._val_log_counter = 0
-            self._val_log_counter += 1
-            current_counter = self._val_log_counter
-            log_interval = getattr(self, '_val_log_interval', 50)  # Dùng interval của validation
+            # `output` lúc này là `x` (list of features)
+            return output
 
-        log_this_batch = (current_counter == 1 or (current_counter % log_interval == 0))
-        # <<< KẾT THÚC SỬA LOGIC COUNTER >>>
+            # 3. Nếu đang inference/validation, giải-méo (de-warp) các bboxes
+        y_warped, x_warped = output  # Unpack tuple (preds, features)
 
-        theta_from_stn = None
-        stn_found = False
-        stn_instance = None
-        try:
-            stn_instance = self._lazy_find_stn()
-            if stn_instance and hasattr(stn_instance, 'theta') and stn_instance.theta is not None:
-                theta_from_stn = stn_instance.theta
-                stn_found = True
+        if self.active:
+            self._lazy_find_stn()  # Tìm STN
+            if self._stn and hasattr(self._stn, "theta") and self._stn.theta is not None:
 
-            is_active = self.active and isinstance(x, (list, tuple))
-            theta_shape = theta_from_stn.shape if theta_from_stn is not None else "None"
+                # Lấy theta (B, 2, 3)
+                theta = self._stn.theta.to(y_warped.device)
 
-            if log_this_batch:  # Chỉ log khi đến lượt
-                theta_val_str = "N/A"
-                if theta_from_stn is not None and theta_from_stn.numel() > 0:
-                    sample_idx = 0
-                    current_batch_size = theta_from_stn.shape[0]
-                    if sample_idx < current_batch_size:
-                        theta_sample = theta_from_stn[sample_idx].detach().cpu().numpy()
-                        theta_val_str = f"[[{theta_sample[0, 0]:.4f}, {theta_sample[0, 1]:.4f}, {theta_sample[0, 2]:.4f}], [{theta_sample[1, 0]:.4f}, {theta_sample[1, 1]:.4f}, {theta_sample[1, 2]:.4f}]]"
-                    else:
-                        theta_val_str = f"Index {sample_idx} out of bounds for B={current_batch_size}"
-                LOGGER.info(f"[DetectSDTN DEBUG] (Batch {current_counter}, Training={self.training}) "
-                            f"active={is_active}, stn_found={stn_found}, theta shape: {theta_shape}. "
-                            f"Sample[0]: {theta_val_str}")
-        except Exception as e:
-            if log_this_batch:  # Chỉ log khi đến lượt
-                LOGGER.warning(f"[DetectSDTN DEBUG] (Batch {current_counter}) Error checking theta: {e}")
+                # Đảm bảo batch size của theta khớp (trường hợp val batch size khác train)
+                B_preds = y_warped.shape[0]
+                if theta.shape[0] != B_preds:
+                    # Lấy theta của sample đầu tiên và lặp lại
+                    theta = theta[0:1].expand(B_preds, -1, -1)
 
-        # --- STN Active ---
-        if self.active and isinstance(x, (list, tuple)):
-            if stn_instance and hasattr(stn_instance, 'theta') and stn_instance.theta is not None:
+                # Tính theta_inv (B, 2, 3)
+                self.theta_inv_buffer = _invert_affine(theta)
+
+                # Tách bboxes (xyxy) và scores
+                # y_warped là (B, 4+nc, N).
+                boxes_warped_xyxy = y_warped[:, :4, :]  # (B, 4, N)
+                scores_warped = y_warped[:, 4:, :]  # (B, nc, N)
+
+                # Chuyển (B, 4, N) -> (B, N, 4)
+                boxes_warped_permuted = boxes_warped_xyxy.permute(0, 2, 1)  # (B, N, 4)
+
+                # Lấy kích thước ảnh gốc (ví dụ 640x640)
                 try:
-                    current_batch_size_feat = x[0].shape[0]
-                    theta_batch_size = stn_instance.theta.shape[0]
-                    theta_to_use = None
+                    img_size = self.shape[-1] * self.stride[0]  # Lấy lại imgsz (vd: 80 * 8 = 640)
+                    H, W = int(img_size), int(img_size)
+                except Exception:
+                    LOGGER.warning("[DetectSDTN] Không thể lấy H, W từ self.shape, giả định 640x640.")
+                    H, W = 640, 640
 
-                    if theta_batch_size == current_batch_size_feat:
-                        theta_to_use = stn_instance.theta
-                    elif theta_batch_size == 1 and current_batch_size_feat > 1:
-                        theta_to_use = stn_instance.theta.expand(current_batch_size_feat, -1, -1)
-                    else:
-                        if log_this_batch:
-                            LOGGER.error(
-                                f"[DetectSDTN DEBUG] (Batch {current_counter}) Mismatch batch size! Theta: {theta_batch_size}, Feats: {current_batch_size_feat}. Skipping de-warp.")
+                # --- Logic De-warp 4 góc (tương tự _warp_boxes_xywh_with_theta) ---
+                B, N, _ = boxes_warped_permuted.shape
+                if N == 0:  # Không có box nào để de-warp
+                    return output  # Trả về output gốc (không có box)
 
-                    if theta_to_use is not None:
-                        theta_inv = _invert_affine(theta_to_use)  # Gọi hàm đã sửa
-                        x_dewarped = self._dewarp_feats(x, theta_inv)  # Gọi hàm đã sửa
+                x1, y1, x2, y2 = boxes_warped_permuted.unbind(-1)
+                Xs = torch.stack([x1, x2, x2, x1], dim=-1)  # (B, N, 4)
+                Ys = torch.stack([y1, y1, y2, y2], dim=-1)  # (B, N, 4)
 
-                        if log_this_batch:
-                            feat_shapes_before = [f.shape for f in x]
-                            feat_shapes_after = [f.shape for f in x_dewarped]  # Sửa tên biến
-                            LOGGER.info(f"[DetectSDTN DEBUG] (Batch {current_counter}) De-warped features. "
-                                        f"Before: {feat_shapes_before}, After: {feat_shapes_after}")
-                        x = x_dewarped  # Gán lại x
+                pix2norm = lambda p, L: (p / max(L - 1, 1)) * 2.0 - 1.0
+                Xn, Yn = pix2norm(Xs, W), pix2norm(Ys, H)
 
-                except Exception as e:
-                    if log_this_batch:
-                        LOGGER.error(
-                            f"[DetectSDTN DEBUG] (Batch {current_counter}) Error during de-warping: {e}. Using original features.",
-                            exc_info=True)
-            else:
-                if log_this_batch:
-                    LOGGER.warning(f"[DetectSDTN DEBUG] (Batch {current_counter}) "
-                                   f"STN found={stn_found} but theta is None or invalid. Skipping de-warp.")
+                ones = torch.ones_like(Xn)
+                P_in = torch.stack([Xn, Yn, ones], dim=2)  # (B, N, 3, 4)
 
-        # gọi Detect.forward (original) để tính logits / loss
-        return super().forward(x)
+                # Mở rộng theta_inv cho N (số lượng box)
+                th_inv_expanded = self.theta_inv_buffer.unsqueeze(1).expand(-1, N, -1, -1)  # (B, N, 2, 3)
+
+                # (B, N, 2, 3) @ (B, N, 3, 4) -> (B, N, 2, 4)
+                P_out = torch.matmul(th_inv_expanded, P_in)
+
+                Xo, Yo = P_out[..., 0, :], P_out[..., 1, :]  # (B, N, 4)
+
+                norm2pix = lambda p, L: (p + 1.0) * 0.5 * max(L - 1, 1)
+                Xp, Yp = norm2pix(Xo, W), norm2pix(Yo, H)  # (B, N, 4)
+
+                # Lấy min/max của 4 góc đã de-warp
+                x1p, x2p = Xp.min(-1).values, Xp.max(-1).values  # (B, N)
+                y1p, y2p = Yp.min(-1).values, Yp.max(-1).values  # (B, N)
+
+                # Clamp
+                x1p = x1p.clamp(0, W - 1)
+                y1p = y1p.clamp(0, H - 1)
+                x2p = x2p.clamp(0, W - 1)
+                y2p = y2p.clamp(0, H - 1)
+
+                # Đảm bảo x2 > x1
+                x1_final = torch.min(x1p, x2p)
+                x2_final = torch.max(x1p, x2p)
+                y1_final = torch.min(y1p, y2p)
+                y2_final = torch.max(y1p, y2p)
+
+                boxes_dewarped = torch.stack([x1_final, y1_final, x2_final, y2_final], dim=-1)  # (B, N, 4)
+
+                # Chuyển về (B, 4, N)
+                boxes_dewarped = boxes_dewarped.permute(0, 2, 1)
+
+                y_dewarped = torch.cat([boxes_dewarped, scores_warped], dim=1)
+
+                return (y_dewarped, x_warped)  # Trả về tuple đã sửa
+
+        # Nếu không active hoặc không tìm thấy STN, trả về y_warped
+        return output
 # -------------------------------------------------------------------- (ntnhan.0705)
 
 

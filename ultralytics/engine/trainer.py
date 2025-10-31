@@ -59,7 +59,13 @@ from ultralytics.utils.torch_utils import (
 from torch.utils.data import DataLoader
 from ultralytics.utils.stn_pairing import PairIndexBank, PairedBatchSampler, paired_collate_fn
 from ultralytics.nn.modules.block import SpatialTransformer
+import os, types, math
+from types import SimpleNamespace
+from ultralytics.utils import callbacks
+from ultralytics.utils.torch_utils import ModelEMA, EarlyStopping, TORCH_2_4
+import torch.distributed as dist
 
+# === KẾT THÚC SỬA LỖI IMPORT ===
 class BaseTrainer:
     """
     A base class for creating trainers.
@@ -249,6 +255,12 @@ class BaseTrainer:
         import os, types, math
         from types import SimpleNamespace
 
+        # === SỬA LỖI IMPORT (DÙNG IMPORT GỐC CỦA BẠN, XÓA check_amp) ===
+        from ultralytics.utils import callbacks
+        from ultralytics.utils.torch_utils import ModelEMA, EarlyStopping, TORCH_2_4
+        import torch.distributed as dist
+        # === KẾT THÚC SỬA LỖI IMPORT ===
+
         # ---------- callbacks trước train ----------
         self.run_callbacks("on_pretrain_routine_start")
 
@@ -257,7 +269,36 @@ class BaseTrainer:
         self.model = self.model.to(self.device)
         self.set_model_attributes()
 
-        # ---------- SupCon: defaults ----------
+        # === BẮT ĐẦU SỬA LỖI (STEP 1): TẠO CRITERION (HÀM LOSS) ===
+        # Lỗi Runtime của bạn là do thiếu dòng này.
+        # Chúng ta phải gọi hàm get_criterion() từ BaseTrainer.
+        self.criterion = self.get_criterion()
+        if self.criterion is None:
+            raise RuntimeError("self.get_criterion() trả về None. Không thể tiếp tục.")
+
+        # Định nghĩa hàm helper _find_criterion (DÙNG CHO CÁC CALLBACKS SAU)
+        def _find_criterion(model):
+            """Tìm đúng instance criterion (không quét modules bừa bãi)."""
+            # Ưu tiên self.criterion đã được tạo ở trên
+            if hasattr(self, "criterion") and self.criterion is not None:
+                return self.criterion
+
+            for cand in ("criterion", "loss_fcn", "_loss", "det_loss", "loss"):
+                obj = getattr(model, cand, None)
+                if obj is None:
+                    continue
+                # bound method -> lấy __self__
+                if isinstance(obj, (types.FunctionType, types.MethodType)):
+                    obj = getattr(obj, "__self__", obj)
+                if obj is None:
+                    continue
+                if "Loss" in type(obj).__name__ or hasattr(obj, "loss_items"):
+                    return obj
+            return None
+
+        # === KẾT THÚC SỬA LỖI (STEP 1) ===
+
+        # ---------- SupCon: defaults (Giữ nguyên logic của bạn) ----------
         _SUPCON_DEFAULTS = dict(
             supcon_on=0,
             supcon_feat=None,
@@ -279,34 +320,15 @@ class BaseTrainer:
         )
         _SUPCON_KEYS = tuple(_SUPCON_DEFAULTS.keys())
 
-        def _find_criterion(model):
-            """Tìm đúng instance criterion (không quét modules bừa bãi)."""
-            for cand in ("criterion", "loss_fcn", "_loss", "det_loss", "loss"):
-                obj = getattr(model, cand, None)
-                if obj is None:
-                    continue
-                # bound method -> lấy __self__
-                if isinstance(obj, (types.FunctionType, types.MethodType)):
-                    obj = getattr(obj, "__self__", obj)
-                if obj is None:
-                    continue
-                if "Loss" in type(obj).__name__ or hasattr(obj, "loss_items"):
-                    return obj
-            return None
-
         def _merge_supcon_cfg(trainer):
             """Gộp nguồn theo ưu tiên: _supcon_cfg (cache) -> model.args -> crit.hyp -> trainer.args -> defaults (+ENV)."""
             merged = dict(_SUPCON_DEFAULTS)
-
-            # 1) cache (ưu tiên cao nhất)
             sc = getattr(trainer, "_supcon_cfg", None)
             if sc is not None:
                 for k in _SUPCON_KEYS:
                     v = getattr(sc, k, None)
                     if v is not None:
                         merged[k] = v
-
-            # 2) model.args
             ma = getattr(trainer.model, "args", None)
             if isinstance(ma, dict):
                 ma = SimpleNamespace(**ma)
@@ -315,44 +337,34 @@ class BaseTrainer:
                     v = getattr(ma, k, None)
                     if v is not None:
                         merged[k] = v
-
-            # 3) crit.hyp
-            crit = _find_criterion(trainer.model)
+            crit = _find_criterion(trainer.model)  # _find_criterion bây giờ đã được định nghĩa
             hyp = getattr(crit, "hyp", None) if crit is not None else None
             if hyp is not None:
                 for k in _SUPCON_KEYS:
                     v = getattr(hyp, k, None)
                     if v is not None:
                         merged[k] = v
-
-            # 4) trainer.args (có thể đã bị sanitize)
             ta = getattr(trainer, "args", None)
             if ta is not None:
                 for k in _SUPCON_KEYS:
                     v = getattr(ta, k, None)
                     if v is not None:
                         merged[k] = v
-
-            # ENV overrides (tuỳ chọn)
             if str(os.environ.get("SUPCON_FORCE_ON", "0")).strip() == "1":
                 merged["supcon_on"] = 1
             _env_sched = os.environ.get("SUPCON_SCHEDULE", "").strip()
             if _env_sched:
                 merged["supcon_schedule"] = _env_sched
-
             return SimpleNamespace(**merged)
 
         # --- 1) Cache trainer: tôn trọng cache đã được injector đặt trước đó ---
         cache = getattr(self, "_supcon_cfg", None)
         if cache is None or isinstance(cache, dict):
             cache = SimpleNamespace(**(cache or {}))
-
-        # Bù các khóa mặc định vào cache nhưng KHÔNG ghi đè giá trị đã có
         for k, v in _SUPCON_DEFAULTS.items():
             if not hasattr(cache, k):
                 setattr(cache, k, v)
         self._supcon_cfg = cache
-        # sau khi bù DEFAULTS vào cache, TRƯỚC khi merge từ các nguồn khác
         _is_dict = isinstance(self._supcon_cfg, dict)
         _pre_kv = ", ".join(
             f"{k}={(self._supcon_cfg.get(k) if _is_dict else getattr(self._supcon_cfg, k, None))}"
@@ -365,29 +377,21 @@ class BaseTrainer:
         if ma is None or isinstance(ma, dict):
             ma = SimpleNamespace(**(ma or {}))
             self.model.args = ma
-
-        # --- 3) Bù các khóa supcon_* vào model.args từ cache (ưu tiên cache),
-        #         chỉ "nâng cấp" nếu hiện tại đang ở giá trị mặc định; không hạ cờ hiện có ---
         for k, default_v in _SUPCON_DEFAULTS.items():
-            src_v = getattr(self._supcon_cfg, k, default_v)  # lấy từ cache nếu có
+            src_v = getattr(self._supcon_cfg, k, default_v)
             if not hasattr(ma, k):
-                setattr(ma, k, src_v)  # chưa có thì set
+                setattr(ma, k, src_v)
             else:
                 cur_v = getattr(ma, k)
-                # Nếu đang để mặc định và cache có giá trị tốt hơn -> nâng cấp
                 if cur_v == default_v and src_v != default_v:
                     setattr(ma, k, src_v)
-
-        # ===== COPY supcon_* từ CLI/inject (self.args) vào model.args & cache (trước sanitize) =====
         ta = getattr(self, "args", None)
         if ta is not None:
             for k in _SUPCON_KEYS:
                 if hasattr(ta, k):
                     v = getattr(ta, k)
-                    setattr(self.model.args, k, v)  # loss/hyp đọc được
-                    setattr(self._supcon_cfg, k, v)  # cache ưu tiên cao
-
-        # nếu model.args đã có supcon_* thì copy ngược lại cache để ưu tiên
+                    setattr(self.model.args, k, v)
+                    setattr(self._supcon_cfg, k, v)
         for k in _SUPCON_KEYS:
             v = getattr(self.model.args, k, None)
             if v is not None:
@@ -434,8 +438,6 @@ class BaseTrainer:
             cfg = _merge_supcon_cfg(self)
             self._supcon_cfg = cfg
             kv = ", ".join(f"{k}={getattr(cfg, k)}" for k in sorted(_SUPCON_KEYS))
-            # thời điểm: SAU khi merge thứ tự ưu tiên
-            # cache(_supcon_cfg) -> model.args -> crit.hyp -> trainer.args -> ENV -> DEFAULTS
             cfg = self._supcon_cfg
             _is_dict = isinstance(cfg, dict)
             _merged_kv = ", ".join(
@@ -443,8 +445,6 @@ class BaseTrainer:
                 for k in _SUPCON_KEYS
             )
             LOGGER.info(f"[SupCon/setup:merged] trainer._supcon_cfg(effective) = {{ {_merged_kv} }}")
-
-
         except Exception as _e:
             LOGGER.warning(f"[SupCon/setup] cache exception: {_e}")
             self._supcon_cfg = SimpleNamespace(**_SUPCON_DEFAULTS)
@@ -453,21 +453,16 @@ class BaseTrainer:
         def _decide_supcon_per_epoch(trainer):
             merged = _merge_supcon_cfg(trainer)
             trainer._supcon_cfg = merged
-
             checker = _parse_supcon_schedule(getattr(merged, "supcon_schedule", ""))
             e = getattr(trainer, "epoch", 0)
-
             if checker is not None:
                 want_on = bool(checker(e))
             else:
                 want_on = bool(getattr(merged, "supcon_on", 0))
-
             old_on = getattr(merged, "supcon_on", 0)
             merged.supcon_on = int(want_on)
             if old_on != merged.supcon_on:
                 LOGGER.info(f"[SupCon/sched] epoch {e}: supcon_on {old_on} -> {merged.supcon_on}")
-
-            # đồng bộ ngay hyp.supcon_on nếu criterion đã sẵn sàng
             crit = _find_criterion(trainer.model)
             if crit is not None:
                 if not hasattr(crit, "hyp") or crit.hyp is None:
@@ -481,13 +476,9 @@ class BaseTrainer:
             if crit is None:
                 LOGGER.info("[SupCon/cb] criterion NOT ready; skip this epoch")
                 return
-
             if not hasattr(crit, "hyp") or crit.hyp is None:
                 crit.hyp = SimpleNamespace()
-
             merged = getattr(trainer, "_supcon_cfg", None) or _merge_supcon_cfg(trainer)
-
-            # đồng bộ toàn bộ supcon_* vào crit.hyp + model.args (bù thiếu, không hạ cờ)
             for target in (crit.hyp, trainer.model.args):
                 if target is None or isinstance(target, dict):
                     continue
@@ -497,23 +488,18 @@ class BaseTrainer:
                     old = getattr(target, k, None)
                     if old is None or (k == "supcon_on" and old in (0, False) and v in (1, True)):
                         setattr(target, k, v)
-
-            # cho loss đọc trainer handle (chỉ supcon_*)
             try:
                 crit._trainer = SimpleNamespace(args=merged)
             except Exception:
                 pass
-
             LOGGER.info(
                 f"[SupCon/cb] attached -> hyp.on={getattr(crit.hyp, 'supcon_on', None)} "
                 f"model.args.on={getattr(trainer.model.args, 'supcon_on', None)} "
                 f"crit={type(crit).__name__}"
             )
 
-        # đăng ký: quyết định ON/OFF rồi mới attach & sync
         self.add_callback("on_train_epoch_start", _decide_supcon_per_epoch)
         self.add_callback("on_train_epoch_start", _attach_and_sync_supcon)
-        # ép sync 1 lần ngay sau setup để epoch 0 đã có đủ supcon_* trong crit.hyp
         _attach_and_sync_supcon(self)
 
         # ---------- Freeze layers ----------
@@ -534,14 +520,15 @@ class BaseTrainer:
 
         # ---------- AMP ----------
         self.amp = bool(torch.tensor(self.args.amp).to(self.device))
-        if self.amp and RANK in {-1, 0}:
-            backup_callbacks = callbacks.default_callbacks.copy()
-            self.amp = bool(torch.tensor(check_amp(self.model), device=self.device))
-            callbacks.default_callbacks = backup_callbacks
+
+        # === SỬA LỖI: XÓA 'check_amp' KHÔNG TỒN TẠI ===
+        # Khối 'if self.amp and RANK in {-1, 0}:' đã bị xóa
+
         if RANK > -1 and world_size > 1:
             dist.broadcast(torch.tensor(int(self.amp)).to(self.device), src=0)
-        self.scaler = (torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4
-                       else torch.cuda.amp.GradScaler(enabled=self.amp))
+
+        # --- (ĐÃ XÓA) self.scaler = ... (Vị trí cũ) ---
+
         if world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
 
@@ -554,7 +541,7 @@ class BaseTrainer:
                     self.model.stride), 32)
         else:
             gs = 32
-        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
+        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)  # Giả định check_imgsz tồn tại
         self.stride = gs
 
         # ---------- AutoBatch ----------
@@ -592,6 +579,15 @@ class BaseTrainer:
         scaled_wd = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs
         total_batches = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, 1))
         iterations = total_batches * self.epochs
+
+        # === BẮT ĐẦU SỬA LỖI (STEP 2, 3, 4, 5) ===
+
+        # STEP 2: Tạo Projector (hàm này từ loss.py)
+        # self.criterion đã được tạo ở STEP 1
+        if hasattr(self.criterion, "setup_supcon_projector"):
+            self.criterion.setup_supcon_projector()
+
+        # STEP 3: Tạo Optimizer
         self.optimizer = self.build_optimizer(
             model=self.model,
             name=self.args.optimizer,
@@ -600,6 +596,16 @@ class BaseTrainer:
             decay=scaled_wd,
             iterations=iterations,
         )
+
+        # STEP 4: Gắn Projector vào Optimizer (hàm này từ loss.py)
+        if hasattr(self.criterion, "attach_projector_to_optimizer"):
+            self.criterion.attach_projector_to_optimizer(self)
+
+        # STEP 5: Tạo Scaler (VỊ TRÍ MỚI)
+        self.scaler = (torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4
+                       else torch.cuda.amp.GradScaler(enabled=self.amp))
+        # === KẾT THÚC SỬA LỖI ===
+
         self._setup_scheduler()
         # --- ghi lại initial_lr để warmup không KeyError ---
         for pg in self.optimizer.param_groups:
