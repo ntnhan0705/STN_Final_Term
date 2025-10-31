@@ -199,40 +199,60 @@ class STNControl(_Ctx):
         for m in self.stn_modules(model):
             self._patch_blend(m, alpha)
 
-    # Ultralytics callbacks
     def on_train_epoch_start(self, trainer):
         model = self.root(trainer)
+        # --- THÊM DÒNG NÀY ---
+        ema_model = getattr(getattr(trainer, "ema", None), "ema", None)
+        # --- KẾT THÚC THÊM ---
         if model is None:
             return
         e = int(getattr(trainer, "epoch", 0))
         self._epoch = e
         if e < self.freeze_epochs:
             self._apply_identity(model, True)
+            if ema_model: self._apply_identity(ema_model, True)  # --- THÊM DÒNG NÀY ---
             self._mode, self._alpha = "identity", 0.0
             if self.log:
                 LOGGER.info(f"[STN] identity @ epoch {e}")
         else:
             a = self._alpha_for(e)
             self._apply_identity(model, False)
+            if ema_model: self._apply_identity(ema_model, False)  # --- THÊM DÒNG NÀY ---
             self._apply_blend(model, a)
+            if ema_model: self._apply_blend(ema_model, a)  # --- THÊM DÒNG NÀY ---
             self._mode, self._alpha = "blend", a
             if self.log:
                 LOGGER.info(f"[STN] blend α={a:.3f} (t≤{self.tmax:.2f}, s∈[{self.smin:.2f},{self.smax:.2f}])")
 
+        # stn_utils.py
+
     def on_val_start(self, validator):
         m = self.root(validator)
+        # --- THÊM 2 DÒNG NÀY ---
+        ema_m = getattr(getattr(validator, "trainer", None), "ema", None)
+        ema_model = getattr(ema_m, "ema", None)
+        # --- KẾT THÚC THÊM ---
         if m is not None:
             self._apply_identity(m, True)
+        if ema_model is not None: self._apply_identity(ema_model, True)  # --- THÊM DÒNG NÀY ---
         if self.log:
             LOGGER.info("[STN] validation: identity")
 
+        # stn_utils.py
+
     def on_val_end(self, validator):
         m = self.root(validator)
+        # --- THÊM 2 DÒNG NÀY ---
+        ema_m = getattr(getattr(validator, "trainer", None), "ema", None)
+        ema_model = getattr(ema_m, "ema", None)
+        # --- KẾT THÚC THÊM ---
         if m is None:
             return
         if self._mode == "blend":
             self._apply_identity(m, False)
+            if ema_model: self._apply_identity(ema_model, False)  # --- THÊM DÒNG NÀY ---
             self._apply_blend(m, self._alpha)
+            if ema_model: self._apply_blend(ema_model, self._alpha)  # --- THÊM DÒNG NÀY ---
             if self.log:
                 LOGGER.info(f"[STN] restore blend α={self._alpha:.3f}")
 
@@ -407,6 +427,22 @@ class DebugImages(_Ctx):
 
         model = trainer.model; device = next(model.parameters()).device
         was_train = model.training; model.eval()
+        # Lấy STNControl callback để biết trạng thái alpha hiện tại
+        stn_control = None
+        for cb in trainer.callbacks.get("on_train_epoch_start", []):
+            if isinstance(cb, STNControl):  # STNControl được import ở đầu file
+                stn_control = cb
+                break
+
+        # Áp dụng thủ công STN patch (blend/identity) CHÍNH XÁC cho việc visualize
+        if stn_control:
+            if stn_control._mode == "blend":
+                stn_control._apply_identity(model, False)  # Tắt identity patch (nếu có)
+                stn_control._apply_blend(model, stn_control._alpha)  # Áp dụng blend patch
+                LOGGER.info(f"[DebugImages] Applied STN blend patch (α={stn_control._alpha:.3f}) for visualization.")
+            else:  # mode == "identity"
+                stn_control._apply_identity(model, True)  # Áp dụng identity patch
+                LOGGER.info(f"[DebugImages] Applied STN identity patch for visualization.")
         H_panel = 672
         try:
             for i,(img0,bxywh,bcls,path0) in enumerate(self.samples):

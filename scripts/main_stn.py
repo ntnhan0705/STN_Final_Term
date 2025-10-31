@@ -35,7 +35,6 @@ DEMO_YAML   = r"C:/OneDrive/Study/AI/STN_Final_Term/dataset.yaml"
 DEMO_MODEL  = r"C:/OneDrive/Study/AI/STN_Final_Term/models/yolo11m_stn.pt"
 DEMO_BGPAIR = r"C:/OneDrive/Study/AI/STN_Final_Term/scripts/bgpair_map.json"
 
-
 # ---------------------- Early VAL identity window ----------------------
 class ValIdentityWindow:
     """Ép STN chạy identity trong validation cho các epoch < until_epoch, và LOG rõ ràng."""
@@ -58,7 +57,6 @@ class ValIdentityWindow:
         if e < self.until:
             self.ctrl.on_val_end(validator)
 
-
 # ---------------------- Helpers ----------------------
 def _resolve_stn_index(ultra_model) -> int | None:
     """
@@ -76,7 +74,6 @@ def _resolve_stn_index(ultra_model) -> int | None:
     except Exception:
         pass
     return None
-
 
 # ---------------------- Training routine ----------------------
 def train_one(args: argparse.Namespace, run_id: int):

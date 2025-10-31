@@ -1047,8 +1047,18 @@ class BaseTrainer:
             metrics (dict): Validation metrics.
             fitness (float): Fitness score (higher is better).
         """
-        metrics = self.validator(self)
-        fitness = metrics.pop("fitness", -float(self.loss.detach().cpu().numpy()))  # default fitness is negative loss if not provided
+        # GỌI VALIDATOR
+        validator_output = self.validator(self)
+
+        # --- SỬA LỖI: Unpack tuple nếu validator trả về tuple ---
+        if isinstance(validator_output, tuple):
+            metrics = validator_output[0]  # Giả định metrics dict là phần tử đầu tiên
+        else:
+            metrics = validator_output
+        # --- KẾT THÚC SỬA LỖI ---
+
+        fitness = metrics.pop("fitness", -float(
+            self.loss.detach().cpu().numpy()))  # default fitness is negative loss if not provided
         if self.best_fitness is None or fitness > self.best_fitness:
             self.best_fitness = fitness
         return metrics, fitness

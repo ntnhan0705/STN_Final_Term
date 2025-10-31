@@ -228,37 +228,37 @@ class DetectSDTN(Detect):
 
     # ---------------- private helpers -----------------
     def _lazy_find_stn(self):
-        """Tìm STN duy nhất qua registry; nếu không có thì sinh θ = identity."""
+        """Tìm STN duy nhất từ global registry; nếu không có thì sinh θ = identity."""
         if self._stn is None:  # Chỉ chạy 1 lần
-            # 1) Ưu tiên lấy STN đầu tiên từ registry toàn cục
-            if hasattr(SpatialTransformer, 'registry') and SpatialTransformer.registry:
-                self._stn = SpatialTransformer.registry[0]
-                LOGGER.info("[DetectSDTN DEBUG] Found STN via global registry.")
-            else:
-                LOGGER.warning(
-                    "[DetectSDTN DEBUG] SpatialTransformer.registry is empty or not found. STN module instance not located.")
-                self._stn = None  # Đảm bảo _stn là None nếu không tìm thấy
 
-            # 2) Nếu không tìm được STN thật, tạo "STN giả" chứa theta = identity
-            if self._stn is None:
-                LOGGER.info("[DetectSDTN DEBUG] Creating Mock STN with identity theta as fallback.")
-
-                class MockSTN:
-                    def __init__(self, identity_theta):
-                        self.theta = identity_theta
-
+            # 1) Cố tìm SpatialTransformer thật từ GLOBAL REGISTRY
+            # (STN phải được import từ .block)
+            if hasattr(SpatialTransformer, "registry") and SpatialTransformer.registry:
+                self._stn = SpatialTransformer.registry[0]  # Lấy STN đầu tiên tìm thấy
                 try:
-                    device = next(self.parameters()).device
-                    dtype = torch.float32
-                    eye = torch.tensor([[1., 0., 0.], [0., 1., 0.]], device=device, dtype=dtype)
-                    theta_identity = eye.view(1, 2, 3)
-                    self._stn = MockSTN(theta_identity)
-                    if not hasattr(self._stn, 'theta') or self._stn.theta is None:
-                        LOGGER.error("[DetectSDTN DEBUG] Failed to initialize Mock STN theta.")
-                        self._stn = None
-                except Exception as e:
-                    LOGGER.error(f"[DetectSDTN DEBUG] Exception creating Mock STN: {e}")
-                    self._stn = None
+                    LOGGER.info(f"[DetectSDTN] Found STN via global registry: {type(self._stn).__name__}")
+                except Exception:
+                    pass
+            else:
+                self._stn = None  # Không tìm thấy
+
+            # 2) Nếu không có, tạo “STN giả” chỉ chứa θ = I_2×3
+            if self._stn is None:
+                try:
+                    LOGGER.warning("[DetectSDTN] No STN in registry. Creating FAKE identity STN.")
+                except Exception:
+                    pass
+
+                # Tạo một object "giả" có thuộc tính .theta
+                # Dùng nn.Module làm object rỗng để nó tương thích với .to(device)
+                self._stn_fake_wrapper = nn.Module()
+                theta_identity = torch.tensor([[1., 0., 0.],
+                                               [0., 1., 0.]], dtype=torch.float32)
+
+                # Dùng register_buffer để nó tự di chuyển theo model.to(device)
+                self._stn_fake_wrapper.register_buffer("theta", theta_identity.unsqueeze(0), persistent=False)
+                # Gán self._stn bằng object "giả" này
+                self._stn = self._stn_fake_wrapper
 
         return self._stn
 
