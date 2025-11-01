@@ -1,0 +1,434 @@
+[
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\000ae00eb3942d27e0b97903dd563a6e.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\000ae00eb3942d27e0b97903dd563a6e.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\000ae00eb3942d27e0b97903dd563a6eOCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\000ae00eb3942d27e0b97903dd563a6eOCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\00c4051383149d0dbe166f38b67c9b52.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\00c4051383149d0dbe166f38b67c9b52.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\00c4051383149d0dbe166f38b67c9b52OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\00c4051383149d0dbe166f38b67c9b52OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\00c726dca086fc483d639dd5f1ca48c0.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\00c726dca086fc483d639dd5f1ca48c0.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\00c726dca086fc483d639dd5f1ca48c0OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\00c726dca086fc483d639dd5f1ca48c0OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\00e9d7e1203324adb7e6fcc02231e3aa.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\00e9d7e1203324adb7e6fcc02231e3aa.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\00e9d7e1203324adb7e6fcc02231e3aaOCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\00e9d7e1203324adb7e6fcc02231e3aaOCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a0b773c653cea6653a1e02faf1566a5.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a0b773c653cea6653a1e02faf1566a5.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a0b773c653cea6653a1e02faf1566a5OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a0b773c653cea6653a1e02faf1566a5OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a26a07d95ed851cdfc7f55f44e2ba77.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a26a07d95ed851cdfc7f55f44e2ba77.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a26a07d95ed851cdfc7f55f44e2ba77OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a26a07d95ed851cdfc7f55f44e2ba77OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a2a1f3849c4b41e6d6715bb919c158a.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a2a1f3849c4b41e6d6715bb919c158a.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a2a1f3849c4b41e6d6715bb919c158aOCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a2a1f3849c4b41e6d6715bb919c158aOCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a2afec0536af1dde1f5468980cf4cbf.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a2afec0536af1dde1f5468980cf4cbf.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a2afec0536af1dde1f5468980cf4cbfOCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a2afec0536af1dde1f5468980cf4cbfOCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a5da3b480ea895bafe976f54050c9f1.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a5da3b480ea895bafe976f54050c9f1.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a5da3b480ea895bafe976f54050c9f1OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a5da3b480ea895bafe976f54050c9f1OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a7aec5bd4485a6f5b67e53a8636305c.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a7aec5bd4485a6f5b67e53a8636305c.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a7aec5bd4485a6f5b67e53a8636305cOCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a7aec5bd4485a6f5b67e53a8636305cOCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a8d69d1c45bece901929db269a5e6cf.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a8d69d1c45bece901929db269a5e6cf.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a8d69d1c45bece901929db269a5e6cfOCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a8d69d1c45bece901929db269a5e6cfOCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a8e6cb00c56ff52e3489ccd6305a758.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a8e6cb00c56ff52e3489ccd6305a758.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0a8e6cb00c56ff52e3489ccd6305a758OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0a8e6cb00c56ff52e3489ccd6305a758OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0aa75e34705ae441a95c2869469c0f31.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0aa75e34705ae441a95c2869469c0f31.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0aa75e34705ae441a95c2869469c0f31OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0aa75e34705ae441a95c2869469c0f31OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0aa9ffc4b4bbe561e983be219497240b.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0aa9ffc4b4bbe561e983be219497240b.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0aa9ffc4b4bbe561e983be219497240bOCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0aa9ffc4b4bbe561e983be219497240bOCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0acfd24d0d78cb27f1a97c5d89e43050.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0acfd24d0d78cb27f1a97c5d89e43050.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0acfd24d0d78cb27f1a97c5d89e43050OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0acfd24d0d78cb27f1a97c5d89e43050OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0ad8663c40dedf625c03ecc586af5c52.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0ad8663c40dedf625c03ecc586af5c52.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0ad8663c40dedf625c03ecc586af5c52OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0ad8663c40dedf625c03ecc586af5c52OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0ae3eb69e2179773256718264fa199b4.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0ae3eb69e2179773256718264fa199b4.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0ae3eb69e2179773256718264fa199b4OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0ae3eb69e2179773256718264fa199b4OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0ae620944412bde5a4698049c2bbd3af.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0ae620944412bde5a4698049c2bbd3af.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0ae620944412bde5a4698049c2bbd3afOCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0ae620944412bde5a4698049c2bbd3afOCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0ae8662d977c0bdcb68f704be748f065.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0ae8662d977c0bdcb68f704be748f065.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0ae8662d977c0bdcb68f704be748f065OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0ae8662d977c0bdcb68f704be748f065OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0aebd7e296fbaae90a154e7989cb7e06.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0aebd7e296fbaae90a154e7989cb7e06.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0aebd7e296fbaae90a154e7989cb7e06OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0aebd7e296fbaae90a154e7989cb7e06OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b029c678b0391bea96cfcc7116b83a1.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b029c678b0391bea96cfcc7116b83a1.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b029c678b0391bea96cfcc7116b83a1OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b029c678b0391bea96cfcc7116b83a1OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b154484e0e38928fc1c0dbfda760ea6.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b154484e0e38928fc1c0dbfda760ea6.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b154484e0e38928fc1c0dbfda760ea6OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b154484e0e38928fc1c0dbfda760ea6OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b4729e08dbd4e916a32804f943853f2.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b4729e08dbd4e916a32804f943853f2.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b4729e08dbd4e916a32804f943853f2OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b4729e08dbd4e916a32804f943853f2OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b78363604f4d81c3e27f90bd3066df6.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b78363604f4d81c3e27f90bd3066df6.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b78363604f4d81c3e27f90bd3066df6OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b78363604f4d81c3e27f90bd3066df6OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b80286547650e8b2686d9a8b8fcc5b1.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b80286547650e8b2686d9a8b8fcc5b1.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b80286547650e8b2686d9a8b8fcc5b1OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b80286547650e8b2686d9a8b8fcc5b1OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b80aaae33916b6c56b4308584cd67c0.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b80aaae33916b6c56b4308584cd67c0.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0b80aaae33916b6c56b4308584cd67c0OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0b80aaae33916b6c56b4308584cd67c0OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0bd02888a92ad8428c8ec8ed971eab12.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0bd02888a92ad8428c8ec8ed971eab12.txt",
+    "hw": [
+      640,
+      640
+    ]
+  },
+  {
+    "im": "C:/OneDrive/Study/AI/STN_Final_Term/datasets/train\\images\\0bd02888a92ad8428c8ec8ed971eab12OCS.png",
+    "lbl": "C:\\OneDrive\\Study\\AI\\STN_Final_Term\\datasets\\train\\labels\\0bd02888a92ad8428c8ec8ed971eab12OCS.txt",
+    "hw": [
+      640,
+      640
+    ]
+  }
+]
