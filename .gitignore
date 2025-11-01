@@ -42,3 +42,10 @@ scripts/*.json
 
 # Sample assets from libs
 ultralytics/assets/
+# Pairing generated outputs
+pairing/bank_out/
+pairing/bank_vis/
+pairing/bgpair_vis/
+pairing/*.json
+pairing/*.npy
+!pairing/.gitkeep
