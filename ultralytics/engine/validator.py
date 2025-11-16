@@ -1,31 +1,20 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
-Check a model's accuracy on a test or val split of a dataset.
+Base validator - compatible with YOLOv8 + custom STN/SupCon pipeline.
 
-Usage:
-    $ yolo mode=val model=yolo11n.pt data=coco8.yaml imgsz=640
-
-Usage - formats:
-    $ yolo mode=val model=yolo11n.pt                 # PyTorch
-                          yolo11n.torchscript        # TorchScript
-                          yolo11n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
-                          yolo11n_openvino_model     # OpenVINO
-                          yolo11n.engine             # TensorRT
-                          yolo11n.mlpackage          # CoreML (macOS-only)
-                          yolo11n_saved_model        # TensorFlow SavedModel
-                          yolo11n.pb                 # TensorFlow GraphDef
-                          yolo11n.tflite             # TensorFlow Lite
-                          yolo11n_edgetpu.tflite     # TensorFlow Edge TPU
-                          yolo11n_paddle_model       # PaddlePaddle
-                          yolo11n.mnn                # MNN
-                          yolo11n_ncnn_model         # NCNN
-                          yolo11n_imx_model          # Sony IMX
-                          yolo11n_rknn_model         # Rockchip RKNN
+Highlights:
+- Safe val-loss path during training (call train graph without updating BN).
+- Robust feature extraction from arbitrary train forward outputs.
+- Prefers detect head maps ('p' in raw) over generic 4D scan; otherwise sorts by H*W.
+- Channel filter equals 'no' (==) to avoid mixing backbone maps with detect head.
+- Flexible criterion call: passes SupCon/STN context if criterion.accepts_ctx is True,
+  otherwise falls back to old API and stashes raw into criterion._external_ctx when available.
+- Clear logging when val-loss is computed or skipped (and why).
 """
 
-import json
 import time
 from pathlib import Path
+import numbers
 
 import numpy as np
 import torch
@@ -34,67 +23,16 @@ from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.utils import LOGGER, TQDM, callbacks, colorstr, emojis, DEFAULT_CFG
-from ultralytics.utils.checks import check_imgsz
-from ultralytics.utils.ops import Profile
 from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
 
 
 class BaseValidator:
     """
-    A base class for creating validators.
-
-    This class provides the foundation for validation processes, including model evaluation, metric computation, and
-    result visualization.
-
-    Attributes:
-        args (SimpleNamespace): Configuration for the validator.
-        dataloader (DataLoader): Dataloader to use for validation.
-        pbar (tqdm): Progress bar to update during validation.
-        model (nn.Module): Model to validate.
-        data (dict): Data dictionary containing dataset information.
-        device (torch.device): Device to use for validation.
-        batch_i (int): Current batch index.
-        training (bool): Whether the model is in training mode.
-        names (dict): Class names mapping.
-        seen (int): Number of images seen so far during validation.
-        stats (dict): Statistics collected during validation.
-        confusion_matrix: Confusion matrix for classification evaluation.
-        nc (int): Number of classes.
-        iouv (torch.Tensor): IoU thresholds from 0.50 to 0.95 in spaces of 0.05.
-        jdict (list): List to store JSON validation results.
-        speed (dict): Dictionary with keys 'preprocess', 'inference', 'loss', 'postprocess' and their respective
-            batch processing times in milliseconds.
-        save_dir (Path): Directory to save results.
-        plots (dict): Dictionary to store plots for visualization.
-        callbacks (dict): Dictionary to store various callback functions.
-
-    Methods:
-        __call__: Execute validation process, running inference on dataloader and computing performance metrics.
-        match_predictions: Match predictions to ground truth objects using IoU.
-        add_callback: Append the given callback to the specified event.
-        run_callbacks: Run all callbacks associated with a specified event.
-        get_dataloader: Get data loader from dataset path and batch size.
-        build_dataset: Build dataset from image path.
-        preprocess: Preprocess an input batch.
-        postprocess: Postprocess the predictions.
-        init_metrics: Initialize performance metrics for the YOLO model.
-        update_metrics: Update metrics based on predictions and batch.
-        finalize_metrics: Finalize and return all metrics.
-        get_stats: Return statistics about the model's performance.
-        check_stats: Check statistics.
-        print_results: Print the results of the model's predictions.
-        get_desc: Get description of the YOLO model.
-        on_plot: Register plots (e.g. to be consumed in callbacks).
-        plot_val_samples: Plot validation samples during training.
-        plot_predictions: Plot YOLO model predictions on batch images.
-        pred_to_json: Convert predictions to JSON format.
-        eval_json: Evaluate and return JSON format of prediction statistics.
+    A base class for creating validators with robust val-loss support during training.
     """
 
     def __init__(self, args=None, dataloader=None, save_dir=None, pbar=None):
-        """Initializes a BaseValidator instance for validation."""
-
-        super().__init__()  # Sửa lỗi TypeError
+        super().__init__()
         self.args = args or get_cfg(DEFAULT_CFG)
         self.dataloader = dataloader
         self.save_dir = save_dir
@@ -106,114 +44,404 @@ class BaseValidator:
         self.callbacks = callbacks.get_default_callbacks()
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.loss = torch.zeros(3)
+        self.skip_loss = False
         self.jdict = []
+        self.plots = {}
         self.on_plot = self.on_plot
         self.pbar_desc = self.get_desc()
 
+        # Accumulators for VAL loss (box, cls, dfl, sup)
+        self._val_items_sum = None  # tensor(4)
+        self._val_items_count = 0
+
+        # Quiet/once-only warnings & flags
+        self._warned_no_criterion = False
+        self._warned_feat_shortage = False
+        self._warned_align_fallback = False
+        self._logged_val_loss_setup = False
+
+    # ---------- Minimal compat for standalone validate ----------
+    def get_data(self):
+        d = getattr(self.args, "data", None)
+        if isinstance(d, (str, Path)):
+            try:
+                return check_det_dataset(d)
+            except Exception:
+                try:
+                    return check_cls_dataset(d)
+                except Exception:
+                    return d
+        return d if d is not None else getattr(self, "data", None)
+
+    # ---------------------- Helpers ----------------------
+    @staticmethod
+    def _flatten_to_float_list(x):
+        if torch.is_tensor(x):
+            return [] if x.numel() == 0 else [float(t) for t in x.detach().flatten().tolist()]
+        if isinstance(x, dict):
+            out = []
+            for v in x.values():
+                out.extend(BaseValidator._flatten_to_float_list(v))
+            return out
+        if isinstance(x, (list, tuple)):
+            out = []
+            for v in x:
+                out.extend(BaseValidator._flatten_to_float_list(v))
+            return out
+        if isinstance(x, numbers.Number):
+            return [float(x)]
+        return []
+
+    @staticmethod
+    def _items_to_vec4(items, device):
+        """
+        Normalize 'items' (from criterion) into tensor[4] = [box, cls, dfl, sup].
+        Accepts dict or any nested structure, with common aliases.
+        """
+        def _first_num(val):
+            fl = BaseValidator._flatten_to_float_list(val)
+            return fl[0] if fl else 0.0
+
+        if isinstance(items, dict):
+            aliases = {
+                "box_loss": ["box_loss", "box", "loss_box"],
+                "cls_loss": ["cls_loss", "cls", "loss_cls"],
+                "dfl_loss": ["dfl_loss", "dfl", "loss_dfl"],
+                "supcon_loss": ["supcon_loss", "sup", "contrastive", "loss_supcon", "sup_loss"],
+            }
+            out = []
+            for _, names in aliases.items():
+                v = 0.0
+                for name in names:
+                    if name in items:
+                        vv = items[name]
+                        if torch.is_tensor(vv):
+                            v = 0.0 if vv.numel() == 0 else float(vv.detach().view(-1)[0].item())
+                        else:
+                            v = _first_num(vv)
+                        break
+                out.append(v)
+            return torch.tensor(out, device=device, dtype=torch.float32)
+
+        flat = BaseValidator._flatten_to_float_list(items)
+        vec = torch.zeros(4, device=device, dtype=torch.float32)
+        n = min(4, len(flat))
+        if n:
+            vec[:n] = torch.tensor(flat[:n], device=device, dtype=torch.float32)
+        return vec
+
+    @staticmethod
+    def _gather_all_4d_tensors(obj, out_list):
+        """Collect all 4D tensors (B,C,H,W) with H>0,W>0 in insertion order."""
+        if torch.is_tensor(obj):
+            if obj.dim() == 4 and obj.shape[2] > 0 and obj.shape[3] > 0:
+                out_list.append(obj)
+            return
+        if isinstance(obj, (list, tuple)):
+            for v in obj:
+                BaseValidator._gather_all_4d_tensors(v, out_list)
+            return
+        if isinstance(obj, dict):
+            for v in obj.values():
+                BaseValidator._gather_all_4d_tensors(v, out_list)
+            return
+
+    @staticmethod
+    def _extract_feats_4d(raw):
+        """
+        Return a list of 4D feature maps (B,C,H,W) for detection loss.
+        Prefer 'known' keys if present; otherwise, scan the entire structure.
+        """
+        if isinstance(raw, dict):
+            for k in ["feats", "features", "p", "out", "outputs", "y", "maps", "raw"]:
+                if k in raw:
+                    lst = []
+                    BaseValidator._gather_all_4d_tensors(raw[k], lst)
+                    if lst:
+                        return lst
+        lst = []
+        BaseValidator._gather_all_4d_tensors(raw, lst)
+        return lst
+
+    @staticmethod
+    def _align_pyramid(feats4d, expected_n):
+        """
+        Sort by spatial area (H*W) desc and pick exactly expected_n maps.
+        Returns (ok, feats_aligned). ok=False if insufficient maps.
+        """
+        if not feats4d:
+            return False, []
+        feats4d_sorted = sorted(feats4d, key=lambda t: int(t.shape[2]) * int(t.shape[3]), reverse=True)
+        if len(feats4d_sorted) < expected_n:
+            return False, feats4d_sorted
+        return True, feats4d_sorted[:expected_n]
+
+    @staticmethod
+    def _call_criterion_safely(criterion_fn, *args, **kwargs):
+        """Wrap criterion call (caller handles try/except)."""
+        return criterion_fn(*args, **kwargs)
+
+    @staticmethod
+    def _collect_supcon_ctx(raw):
+        """Pick common SupCon/STN context keys from raw."""
+        ctx = {}
+        if isinstance(raw, dict):
+            for k in ("stn_feat", "supcon_feat", "theta", "stn_theta", "state", "aux"):
+                if k in raw:
+                    ctx[k] = raw[k]
+        return ctx
+
+    # ---------------------- Main entry ----------------------
     @torch.no_grad()
     @smart_inference_mode()
     def __call__(self, trainer=None, model=None):
-        """
-        Supports validation of a pre-trained model if passed or a model being trained if trainer is passed (trainer
-        gets priority).
-        """
+        """Validate during training (preferred) or standalone."""
         self.training = trainer is not None
         augment = self.args.augment and (not self.training)
+
         if self.training:
+            # ===== VALIDATE DURING TRAIN =====
             self.device = trainer.device
             self.data = trainer.data
-            # self.args.half = trainer.amp # Tạm vô hiệu hóa, validator nên dùng args.half riêng
-            self.model = trainer.model  # Gán self.model để tham chiếu
-            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)  # Sửa lỗi từ trainer.loss
-            self.args.plots |= trainer.args.plots
-            self.metrics.speed = self.speed
+            self.args.half = False
             self.save_dir = trainer.save_dir
 
-            # Lấy model EMA (nếu có)
-            model = trainer.ema.ema or trainer.model
-            model = model.half() if self.args.half else model.float()
+            self._val_items_sum = torch.zeros(4, device=self.device, dtype=torch.float32)
+            self._val_items_count = 0
 
+            model_infer = trainer.ema.ema or trainer.model
+            model_infer = model_infer.float().eval()
+            self.model = trainer.model  # training model for val-loss
+            model = model_infer
+
+            if not self.dataloader:
+                self.dataloader = self.get_dataloader(self.data.get(self.args.split), self.args.batch)
             if self.pbar is None:
                 self.pbar = TQDM(self.dataloader, desc=self.pbar_desc, total=len(self.dataloader))
+
+            if not self._logged_val_loss_setup:
+                LOGGER.info("[Validator] Training-mode validation: will compute val-loss from train graph without BN updates.")
+                self._logged_val_loss_setup = True
+
         else:
+            # ===== STANDALONE VALIDATE =====
             callbacks.add_integration_callbacks(self)
             self.run_callbacks("on_val_start")
             assert model is not None, "Either trainer or model is required for validation"
+
             self.device = select_device(self.args.device, self.args.batch)
             self.args.half &= self.device.type != "cpu"
-            if self.args.half:
-                model.half()
-            self.model = model  # Gán self.model
-            self.model.eval()
+
+            if isinstance(model, (str, Path)):
+                model = AutoBackend(
+                    model,
+                    device=self.device,
+                    dnn=getattr(self.args, "dnn", False),
+                    fp16=self.args.half,
+                )
+            elif isinstance(model, torch.nn.Module):
+                if self.args.half and self.device.type != "cpu" and hasattr(model, "half"):
+                    model = model.half()
+                else:
+                    model = model.float()
+            else:
+                raise TypeError(f"validator: unsupported model type {type(model)}")
+
+            self.model = model.eval()
             self.data = self.get_data()
             if self.device.type == "cpu":
                 self.args.workers = 0
             if not self.dataloader:
                 self.dataloader = self.get_dataloader(self.data.get(self.args.split), self.args.batch)
-
             if self.pbar is None:
                 self.pbar = TQDM(self.dataloader, desc=self.pbar_desc, total=len(self.dataloader))
 
-            model.warmup(imgsz=(1 if self.args.pt else self.args.batch, 3, *self.args.imgsz))
+            # Optional warmup
+            imsz = self.args.imgsz
+            if isinstance(imsz, int):
+                imsz = (imsz, imsz)
+            bs = 1 if getattr(self.args, "pt", True) else getattr(self.args, "batch", 1)
+            warm = getattr(model, "warmup", None)
+            if callable(warm):
+                try:
+                    warm(imgsz=(bs, 3, *imsz))
+                except Exception:
+                    pass
+            else:
+                try:
+                    dev = next(model.parameters()).device if isinstance(model, torch.nn.Module) else self.device
+                    dummy = torch.zeros(bs, 3, imsz[0], imsz[1], device=dev)
+                    model(dummy)
+                except Exception:
+                    pass
 
+        # === Validation loop ===
+        from ultralytics.utils.ops import Profile
         dt = (Profile(), Profile(), Profile(), Profile())
         bar = self.pbar
 
-        # <<< SỬA LỖI 'NoneType' object has no attribute 'names' >>>
-        # Đảm bảo model (dù là EMA hay model gốc) có thuộc tính 'names'
-        # Lấy 'names' từ 'self.data' (đã được gán từ trainer.data ở trên)
-        if hasattr(self.data, 'names'):
-            model.names = self.data['names']
-        elif hasattr(self.model, 'names'):  # Fallback lấy từ self.model
+        # names
+        if isinstance(self.data, dict) and "names" in self.data and model is not None:
+            model.names = self.data["names"]
+        elif hasattr(self.model, "names") and model is not None:
             model.names = self.model.names
-        else:
-            # Fallback nếu self.data cũng không có names (trường hợp hiếm)
-            LOGGER.warning("Validator could not find 'names' attribute on model or data. Using default names.")
-            # Tự tạo names dựa trên nc nếu có
-            if hasattr(self, 'nc') and self.nc:
-                model.names = {i: f'class_{i}' for i in range(self.nc)}
-            # Nếu không thì init_metrics sẽ thất bại (nhưng lỗi sẽ rõ ràng hơn)
-        # <<< KẾT THÚC SỬA LỖI >>>
 
-        self.init_metrics(de_parallel(model))  # Bây giờ model đã có .names
-        self.jdict = []  # reset jdict
+        self.init_metrics(de_parallel(model if isinstance(model, torch.nn.Module) else self.model))
+        self.jdict = []
+
         for batch_i, batch in enumerate(bar):
             self.run_callbacks("on_val_batch_start")
             self.batch_i = batch_i
+
             # Preprocess
             with dt[0]:
                 batch = self.preprocess(batch)
 
-            # Inference
+            # Inference path (eval) for metrics
             with dt[1]:
-                preds = model(batch["img"], augment=augment)  # augment=self.args.augment
+                preds = model(batch["img"], augment=augment)
 
-            # Loss
+            # ---------- val-loss via train-path (quiet & robust) ----------
             with dt[2]:
                 if self.training:
-                    if hasattr(self.model, 'loss') and callable(self.model.loss):  # Dùng self.model gốc để tính loss
-                        self.loss += self.model.loss(batch, preds)[1]
+                    bn_states = []
+                    try:
+                        model_train = self.model
+                        was_training = getattr(model_train, "training", False)
+                        model_train.train()  # to produce raw detect head outputs (train path)
 
-            # <<< LOG DEBUG VỚI INTERVAL 50 BATCH (Giữ nguyên) >>>
-            try:
-                val_log_interval = 50
-                if self.batch_i % val_log_interval == 0:
-                    pred_tensor = preds[0] if isinstance(preds, (list, tuple)) else preds
-                    if isinstance(pred_tensor, torch.Tensor):
-                        scores_sigmoid = pred_tensor[..., 4:].sigmoid()
-                        LOGGER.info(
-                            f"[Validator DEBUG] (Batch {self.batch_i}) Raw preds[0] - shape: {pred_tensor.shape}, "
-                            f"max score: {scores_sigmoid.max():.4f}, "
-                            f"num > 0.01: {(scores_sigmoid > 0.01).sum()}")
-                    else:
-                        LOGGER.info(
-                            f"[Validator DEBUG] (Batch {self.batch_i}) Raw preds type before NMS: {type(preds)}")
-            except Exception as e:
-                if self.batch_i % val_log_interval == 0:
-                    LOGGER.warning(f"[Validator DEBUG] (Batch {self.batch_i}) Error logging raw preds: {e}")
-            # <<< KẾT THÚC LOG DEBUG >>>
+                        # Freeze BN updates during val-loss
+                        for m in model_train.modules():
+                            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                                bn_states.append((m, m.training))
+                                m.eval()
 
-            # Postprocess
+                        # Forward on training graph (no grads due to no_grad)
+                        raw = model_train(batch["img"], augment=False, profile=False)
+
+                        # Extract 4D detection maps
+                        feats4d_all = self._extract_feats_4d(raw)
+
+                        # Expected nl from criterion (fallback to 3)
+                        criterion_obj = getattr(trainer, "criterion", None)
+                        expected_n = 0
+                        if hasattr(criterion_obj, "stride"):
+                            try:
+                                expected_n = len(criterion_obj.stride)
+                            except Exception:
+                                expected_n = 0
+                        if not expected_n:
+                            expected_n = 3
+
+                        # Channel filter: keep maps whose channels exactly match criterion.no
+                        min_no = 0
+                        try:
+                            min_no = int(getattr(criterion_obj, "no", 0) or 0)
+                        except Exception:
+                            min_no = 0
+                        feats4d = feats4d_all
+                        if min_no > 0:
+                            kept = [t for t in feats4d_all if int(t.shape[1]) == min_no]
+                            if kept:
+                                feats4d = kept
+                            else:
+                                if not self._warned_align_fallback:
+                                    LOGGER.warning(
+                                        f"[Validator] No maps with channels == no ({min_no}). "
+                                        f"Falling back to unfiltered 4D maps (may pick backbone)."
+                                    )
+                                    self._warned_align_fallback = True
+
+                        # Prefer canonical detect head order if available
+                        if isinstance(raw, dict) and "p" in raw and isinstance(raw["p"], (list, tuple)):
+                            feats_list = list(raw["p"])[:expected_n]
+                            if batch_i == 0:
+                                shapes = [tuple(t.shape) for t in feats_list]
+                                LOGGER.info(f"[Validator] Using raw['p'] for detect maps (nl={len(feats_list)}): {shapes}")
+                        else:
+                            ok, feats_list = self._align_pyramid(feats4d, expected_n)
+                            if not ok:
+                                if not self._warned_feat_shortage:
+                                    LOGGER.warning(
+                                        f"[Validator] Val-loss skipped: need {expected_n} maps, "
+                                        f"got {len(feats4d)} (total_4d={len(feats4d_all)})."
+                                    )
+                                    self._warned_feat_shortage = True
+                                raise RuntimeError("insufficient feature maps for detection loss")
+                            if batch_i == 0 and not self._warned_align_fallback:
+                                shapes = [tuple(t.shape) for t in feats_list]
+                                LOGGER.info(f"[Validator] Using H*W sort fallback for detect maps: {shapes}")
+                                self._warned_align_fallback = True
+
+                        # Use the trainer's detection criterion
+                        criterion_fn = getattr(trainer, "criterion", None)
+                        if not callable(criterion_fn):
+                            if not self._warned_no_criterion:
+                                LOGGER.warning("[Validator] Val-loss disabled: trainer.criterion is missing or not callable.")
+                                self._warned_no_criterion = True
+                            raise RuntimeError("no detection criterion")
+
+                        # Build SupCon/STN context
+                        ctx = {"feats": feats_list}
+                        sup_ctx = self._collect_supcon_ctx(raw)
+                        ctx.update(sup_ctx)
+
+                        # Criterion call: prefers context API if supported
+                        try:
+                            if getattr(criterion_obj, "accepts_ctx", False):
+                                if batch_i == 0:
+                                    LOGGER.info("[Validator] Calling criterion(ctx, batch) with SupCon/STN context.")
+                                total, items = self._call_criterion_safely(criterion_fn, ctx, batch)
+                            else:
+                                # Back-compat: stash raw for old-style criterions that sniff external ctx
+                                try:
+                                    setattr(criterion_obj, "_external_ctx", raw)
+                                except Exception:
+                                    pass
+                                if batch_i == 0:
+                                    LOGGER.info("[Validator] Calling criterion(feats, batch) (legacy path).")
+                                total, items = self._call_criterion_safely(criterion_fn, feats_list, batch)
+                        except Exception as e:
+                            LOGGER.warning(f"[Validator] Val-loss criterion error at batch {batch_i}: {e}. Skipping this batch.")
+                            raise
+
+                        # items -> vec4 and accumulate
+                        items_t = self._items_to_vec4(items, self.device)
+                        if self._val_items_sum is None:
+                            self._val_items_sum = torch.zeros(4, device=self.device, dtype=torch.float32)
+                            self._val_items_count = 0
+                        self._val_items_sum += items_t
+                        self._val_items_count += 1
+
+                        # Update progress bar (avg val-loss components)
+                        if self.pbar is not None and self._val_items_count > 0:
+                            avg = (self._val_items_sum / max(1, self._val_items_count)).detach().float().cpu().tolist()
+                            vbox, vcls, vdfl, vsup = (avg + [0.0, 0.0, 0.0, 0.0])[:4]
+                            try:
+                                self.pbar.set_postfix_str(
+                                    f"vbox={vbox:.3f} vcls={vcls:.3f} vdfl={vdfl:.3f} vsup={vsup:.3f} "
+                                    f"vtot={(vbox + vcls + vdfl + vsup):.3f}",
+                                    refresh=False,
+                                )
+                            except Exception:
+                                pass
+
+                    except Exception:
+                        # Quietly skip this batch val-loss (already logged why)
+                        pass
+                    finally:
+                        # Restore BN + train/eval state
+                        try:
+                            for m, prev in bn_states:
+                                m.train(prev)
+                        except Exception:
+                            pass
+                        try:
+                            model_train.train(was_training)
+                        except Exception:
+                            pass
+
+            # Postprocess & metrics
             with dt[3]:
                 preds = self.postprocess(preds)
 
@@ -224,142 +452,139 @@ class BaseValidator:
 
             self.run_callbacks("on_val_batch_end")
 
+        # ---- Finalize ----
         stats = self.get_stats()
         self.check_stats(stats)
+        n = max(1, len(self.dataloader))
         self.speed = {
-            "preprocess": dt[0].dt * 1e3 / len(self.dataloader),
-            "inference": dt[1].dt * 1e3 / len(self.dataloader),
-            "loss": dt[2].dt * 1e3 / len(self.dataloader),
-            "postprocess": dt[3].dt * 1e3 / len(self.dataloader),
+            "preprocess": dt[0].dt * 1e3 / n,
+            "inference": dt[1].dt * 1e3 / n,
+            "loss": dt[2].dt * 1e3 / n,
+            "postprocess": dt[3].dt * 1e3 / n,
         }
-        self.metrics.speed = self.speed
         self.finalize_metrics()
         self.print_results()
         self.run_callbacks("on_val_end")
+
+        # ---- Write aggregated val-loss to stats (during training only) ----
         if self.training:
-            self.loss /= len(self.dataloader)
-            return stats, self.loss.cpu().numpy()
+            if self._val_items_count > 0:
+                avg_items = (self._val_items_sum / max(1, self._val_items_count)).detach().float().cpu()
+
+                def _get(i):
+                    return float(avg_items[i].item()) if i < avg_items.numel() else 0.0
+
+                box_m = _get(0)
+                cls_m = _get(1)
+                dfl_m = _get(2)
+                sup_m = _get(3)
+
+                stats["val/box_loss"] = box_m
+                stats["val/cls_loss"] = cls_m
+                stats["val/dfl_loss"] = dfl_m
+                stats["val/sup_loss"] = sup_m
+                stats["val/loss"] = box_m + cls_m + dfl_m + sup_m
+
+                if hasattr(self, "metrics") and hasattr(self.metrics, "results_dict"):
+                    self.metrics.results_dict["val/box_loss"] = box_m
+                    self.metrics.results_dict["val/cls_loss"] = cls_m
+                    self.metrics.results_dict["val/dfl_loss"] = dfl_m
+                    self.metrics.results_dict["val/sup_loss"] = sup_m
+
+                LOGGER.info(
+                    f"[VAL/LOSS] box={box_m:.4f} | cls={cls_m:.4f} | dfl={dfl_m:.4f} | sup={sup_m:.4f} | "
+                    f"total={box_m+cls_m+dfl_m+sup_m:.4f}"
+                )
+            else:
+                zeros = {"val/box_loss": 0.0, "val/cls_loss": 0.0, "val/dfl_loss": 0.0, "val/sup_loss": 0.0}
+                stats.update({**zeros, "val/loss": 0.0})
+                if hasattr(self, "metrics") and hasattr(self.metrics, "results_dict"):
+                    self.metrics.results_dict.update(zeros)
+                LOGGER.warning("[Validator] No val-loss batches were aggregated (all skipped).")
+
+            stats.setdefault(
+                "fitness",
+                float(stats.get("metrics/mAP50-95", stats.get("mAP50-95", stats.get("map50-95", 0.0)))),
+            )
+
         return stats
 
+    # ---------------------- Stubs/boilerplate ----------------------
     def match_predictions(
         self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
     ) -> torch.Tensor:
-        """
-        Match predictions to ground truth objects using IoU.
-
-        Args:
-            pred_classes (torch.Tensor): Predicted class indices of shape (N,).
-            true_classes (torch.Tensor): Target class indices of shape (M,).
-            iou (torch.Tensor): An NxM tensor containing the pairwise IoU values for predictions and ground truth.
-            use_scipy (bool): Whether to use scipy for matching (more precise).
-
-        Returns:
-            (torch.Tensor): Correct tensor of shape (N, 10) for 10 IoU thresholds.
-        """
-        # Dx10 matrix, where D - detections, 10 - IoU thresholds
         correct = np.zeros((pred_classes.shape[0], self.iouv.shape[0])).astype(bool)
-        # LxD matrix where L - labels (rows), D - detections (columns)
         correct_class = true_classes[:, None] == pred_classes
-        iou = iou * correct_class  # zero out the wrong classes
+        iou = iou * correct_class
         iou = iou.cpu().numpy()
         for i, threshold in enumerate(self.iouv.cpu().tolist()):
-            if use_scipy:
-                # WARNING: known issue that reduces mAP in https://github.com/ultralytics/ultralytics/pull/4708
-                import scipy  # scope import to avoid importing for all commands
-
-                cost_matrix = iou * (iou >= threshold)
-                if cost_matrix.any():
-                    labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix)
-                    valid = cost_matrix[labels_idx, detections_idx] > 0
-                    if valid.any():
-                        correct[detections_idx[valid], i] = True
-            else:
-                matches = np.nonzero(iou >= threshold)  # IoU > threshold and classes match
-                matches = np.array(matches).T
-                if matches.shape[0]:
-                    if matches.shape[0] > 1:
-                        matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
-                        matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                        # matches = matches[matches[:, 2].argsort()[::-1]]
-                        matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-                    correct[matches[:, 1].astype(int), i] = True
+            matches = np.nonzero(iou >= threshold)
+            matches = np.array(matches).T
+            if matches.shape[0]:
+                if matches.shape[0] > 1:
+                    matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
+                    matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                    matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+                correct[matches[:, 1].astype(int), i] = True
         return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
 
     def add_callback(self, event: str, callback):
-        """Append the given callback to the specified event."""
         self.callbacks[event].append(callback)
 
     def run_callbacks(self, event: str):
-        """Run all callbacks associated with a specified event."""
         for callback in self.callbacks.get(event, []):
             callback(self)
 
     def get_dataloader(self, dataset_path, batch_size):
-        """Get data loader from dataset path and batch size."""
         raise NotImplementedError("get_dataloader function not implemented for this validator")
 
     def build_dataset(self, img_path):
-        """Build dataset from image path."""
         raise NotImplementedError("build_dataset function not implemented in validator")
 
     def preprocess(self, batch):
-        """Preprocess an input batch."""
         return batch
 
     def postprocess(self, preds):
-        """Postprocess the predictions."""
         return preds
 
     def init_metrics(self, model):
-        """Initialize performance metrics for the YOLO model."""
         pass
 
     def update_metrics(self, preds, batch):
-        """Update metrics based on predictions and batch."""
         pass
 
     def finalize_metrics(self, *args, **kwargs):
-        """Finalize and return all metrics."""
         pass
 
     def get_stats(self):
-        """Return statistics about the model's performance."""
         return {}
 
     def check_stats(self, stats):
-        """Check statistics."""
         pass
 
     def print_results(self):
-        """Print the results of the model's predictions."""
         pass
 
     def get_desc(self):
-        """Get description of the YOLO model."""
-        pass
+        return "Validating"
 
     @property
     def metric_keys(self):
-        """Return the metric keys used in YOLO training/validation."""
         return []
 
     def on_plot(self, name, data=None):
-        """Register plots (e.g. to be consumed in callbacks)."""
+        if not hasattr(self, "plots"):
+            self.plots = {}
         self.plots[Path(name)] = {"data": data, "timestamp": time.time()}
 
-    # TODO: may need to put these following functions into callback
     def plot_val_samples(self, batch, ni):
-        """Plot validation samples during training."""
         pass
 
     def plot_predictions(self, batch, preds, ni):
-        """Plot YOLO model predictions on batch images."""
         pass
 
     def pred_to_json(self, preds, batch):
-        """Convert predictions to JSON format."""
         pass
 
     def eval_json(self, stats):
-        """Evaluate and return JSON format of prediction statistics."""
         pass

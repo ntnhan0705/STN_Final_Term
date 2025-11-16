@@ -80,7 +80,15 @@ class SpatialTransformer(nn.Module):
     #   (mỗi instance tự thêm mình vào list này)
     # ------------------------------------------------------------------
     registry: list["SpatialTransformer"] = []
-
+    _stn_forward_orig = None
+    _stn_identity_forward = None
+    _stn_blend_forward = None
+    _stn_mode = "identity"
+    _stn_blend_alpha = 1.0
+    _stn_tmax = 0.20
+    _stn_smin = 0.90
+    _stn_smax = 1.10
+    _stn_stabilize_rot = False
     # ----------------------------- INIT -------------------------------
     def __init__(self, c1: int):
         """

@@ -1,19 +1,21 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 from __future__ import annotations
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
-from ultralytics.nn.modules.block import SpatialTransformer
 from torchvision.ops import roi_align
-from ultralytics.utils import LOGGER
 from types import SimpleNamespace
-import os
+import os, json
+import torch
+import torch.nn.functional as F
+from ultralytics.utils import LOGGER
+import torch.nn as nn
+from ultralytics.utils.tal import TaskAlignedAssigner
+from typing import Optional
+
 class KeypointLoss(nn.Module):
     """Criterion class for computing keypoint losses."""
 
@@ -127,127 +129,117 @@ class RotatedBboxLoss(BboxLoss):
         return loss_iou, loss_dfl
 
 # ----------------------------------------------------------------------(ntnhan.0705)
-from types import SimpleNamespace
-import os, json
-import torch
-import torch.nn.functional as F
-from ultralytics.utils import LOGGER
+# ----------------------------- Helper nhỏ an toàn -----------------------------
+def _safe_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    if x is None:
+        return x
+    denom = x.norm(p=2, dim=1, keepdim=True).clamp_min(eps)
+    return x / denom
 
 # ========================================================================== #
-#                           SupCon Projection Head                           #
+#                              SupCon Projection                             #
 # ========================================================================== #
+class SupConProjection(nn.Module):
+    """
+    MLP projector cho SupCon.
 
-class SupConProjection(torch.nn.Module):
-    """Lazy MLP head: build at first forward once in_dim is known."""
-    def __init__(self, out_dim: int, hidden: int = 0, bn: bool = True):
+    - Chuẩn hoá đầu giữa: bn ∈ {0,1,2} tương ứng {None, BatchNorm1d, LayerNorm}
+      hoặc chuỗi 'none'|'bn'|'ln' (giữ tương thích phiên bản cũ).
+    - Tính toán ở fp32 để ổn định, caller chịu trách nhiệm cast dtype/ device.
+    """
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, bn=1):
         super().__init__()
-        self.out_dim = int(out_dim)
-        self.hidden = int(hidden)
-        self.use_bn = bool(bn)
-        self.net = None
-        self.in_dim = None
+        self.fc1 = nn.Linear(in_dim, hidden)
+        self.bn1 = None
+        if bn == 1 or str(bn).lower() == 'bn':
+            self.bn1 = nn.BatchNorm1d(hidden)
+        elif bn == 2 or str(bn).lower() == 'ln':
+            self.bn1 = nn.LayerNorm(hidden)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(hidden, out_dim)
 
-    def _build(self, in_dim: int):
-        import torch.nn as nn
-        layers = []
-        last = in_dim
-        if self.hidden > 0:
-            layers += [nn.Linear(in_dim, self.hidden), nn.ReLU(inplace=True)]
-            if self.use_bn:
-                layers.append(nn.BatchNorm1d(self.hidden))
-            last = self.hidden
-        layers.append(nn.Linear(last, self.out_dim))
-        self.net = nn.Sequential(*layers)
-        self.in_dim = in_dim
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        if self.bn1 is not None:
+            x = self.bn1(x)
+        x = self.relu(x)
+        return self.fc2(x)
 
-    def forward(self, x):
-        if self.net is None:
-            self._build(x.shape[-1])
-            # đảm bảo các layer vừa tạo ở cùng device với input
-            self.net.to(x.device)
-        return self.net(x)
-
-
-# Danh sách các key SupCon cần đồng bộ
+# ============================ SupCon hyper-keys ============================ #
+# Lưu ý: thêm "supcon_log_n" để throttle số lần in log/epoch (mặc định 6).
 _SUPCON_KEYS = (
     "supcon_on", "supcon_feat", "supcon_warp_gt", "supcon_out",
     "supcon_min_box", "supcon_max_per_class", "supcon_gain", "supcon_loss_weight",
     "supcon_temp", "supcon_warmup", "supcon_log", "supcon_use_mem", "supcon_queue",
-    "supcon_schedule", "supcon_proj_dim", "supcon_proj_hidden", "supcon_proj_bn"
+    "supcon_neg_cap", "supcon_schedule", "supcon_proj_dim", "supcon_proj_hidden", "supcon_proj_bn",
+    "supcon_neg_per_pos", "supcon_min_neg_w", "supcon_log_n"
 )
-
 # ========================================================================== #
-#                            v8DetectionLoss (STN)                           #
+#                               v8DetectionLoss                              #
 # ========================================================================== #
-
 class v8DetectionLoss:
-    """YOLOv8 detection loss + SupCon (ROIAlign trên fmap sau STN)."""
+    """
+    YOLOv8 detection loss + SupCon (ROIAlign trên feature map sau STN).
 
+    Điểm chính đã cleanup:
+    - DFL decode ổn định fp32 + nan_to_num.
+    - SupCon có 2 đường: memory-augmented (_supcon_loss_memory) hoặc batch-only fallback.
+    - Memory queue zero-init (CPU fp16), chỉ enqueue positives (label >= 0).
+    - Throttle log theo epoch: tránh nuốt tqdm (supcon_log_n lần/epoch cho ROI/MEM).
+    - Log tách bạch 2 dòng: [SupConStat/roi] và [SupConStat/mem].
+    """
     def __init__(self, model, tal_topk=10):
-        import torch.nn as nn
-        from ultralytics.nn.modules.block import SpatialTransformer as _STN
-        from ultralytics.utils.tal import TaskAlignedAssigner
-
         self.device = next(model.parameters()).device
         self.model = model
 
-        # --- Safe hyp (SimpleNamespace) + defaults ---
         raw_hyp = getattr(model, "args", None)
-        if raw_hyp is None or isinstance(raw_hyp, dict):
-            self.hyp = SimpleNamespace(**(raw_hyp or {}))
-        else:
-            self.hyp = raw_hyp
+        self.hyp = SimpleNamespace(**(raw_hyp or {})) if raw_hyp is None or isinstance(raw_hyp, dict) else raw_hyp
 
-        # Chuẩn hoá supcon_* ngay từ đầu (không để None)
+        # Đồng bộ SupCon từ model.args / ENV -> self.hyp -> mirror lại vào model.args
         self._normalize_and_mirror_supcon(from_env=True)
-
-        LOGGER.info(f"[LOSS INIT] use_subcon={bool(getattr(self.hyp,'supcon_on',0))}, "
-                    f"subcon_weight={getattr(self.hyp,'supcon_loss_weight', None)}")
+        LOGGER.info(f"[LOSS INIT] use_supcon={bool(getattr(self.hyp,'supcon_on',0))}, "
+                    f"supcon_weight={getattr(self.hyp,'supcon_loss_weight', None)}")
 
         head = model.model[-1]
-
-        # ---- Head properties
         self.nc = head.nc
         self.reg_max = head.reg_max
         self.no = self.nc + self.reg_max * 4
         self.stride = head.stride
         self.use_dfl = self.reg_max > 1
-        self._proj_head = None  # projection head (lazy)
 
-        # ---- Core losses / utils
+        self._proj_head = None
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(self.reg_max).to(self.device)
-        self.proj = torch.arange(self.reg_max, dtype=torch.float, device=self.device)
+        self.proj = torch.arange(self.reg_max, dtype=torch.float32, device=self.device)  # dùng fp32 cố định
 
-        # ---- SupCon memory queue
-        self._mq_feats = None
-        self._mq_labels = None
+        # -------- Memory queue (CPU fp16) --------
+        self._mq_feats: Optional[torch.Tensor] = None   # [Q, C], fp16/CPU
+        self._mq_labels: Optional[torch.Tensor] = None  # [Q], -1 = empty/bg
         self._mq_ptr = 0
-        self._mq_size = int(getattr(self.hyp, "supcon_queue", 2048))
+        self._mq_size = int(getattr(self.hyp, "supcon_queue", 4096))
         self._mq_ready = False
 
-        # ---- STN + feature-after-STN hooks (match TSNE)
+        # -------- STN hooks & features sau STN --------
         self.theta_for_loss = None
         self._stn_module = None
-
-        # Sau STN: lấy fmap 4D, C>=128
         self._aft_min_channels = 128
         self._aft_hooks = []
         self._aft_last = None
 
         stn_seen = False
         for m in model.modules():
-            if isinstance(m, _STN):
+            cname = m.__class__.__name__
+            if cname in ("SpatialTransformer", "STN", "SpatialTransformerV2"):
                 self._stn_module = m
+                # Cho STN gọi ngược để publish theta
                 try:
-                    # Cho STN đẩy theta vào loss (nếu STN hỗ trợ)
                     m.record_theta = self.set_theta
                 except Exception:
                     pass
                 stn_seen = True
                 continue
-
+            # lấy feature map block đầu tiên ngay sau STN để ROIAlign
             if stn_seen and hasattr(m, "forward"):
                 try:
                     h = m.register_forward_hook(self._after_hook)
@@ -255,11 +247,18 @@ class v8DetectionLoss:
                 except Exception:
                     pass
 
-        # ---- misc
+        # -------- SupCon stats / log throttle --------
         self._supcon_stat = {}
+        self._supcon_val = None    # scalar loss để cộng vào det loss
+        self._supcon_prob = None   # mean(exp(num-den)) để tham khảo
         self._printed_hyp = False
 
-    # --------------------- Helpers: đồng bộ / normalize supcon_* ---------------------
+        self._log_epoch = -1
+        self._mem_log_cnt = 0
+        self._roi_log_cnt = 0
+        self._max_logs = int(getattr(self.hyp, "supcon_log_n", 6))  # tối đa N log/epoch cho mỗi nhóm
+
+    # ========================== Đồng bộ SupCon args ========================== #
     def _merge_from_model_args(self):
         ma = getattr(self.model, "args", None)
         if isinstance(ma, SimpleNamespace):
@@ -287,131 +286,279 @@ class v8DetectionLoss:
             pass
 
     def _finalize_supcon(self):
-        # Không để None, đảm bảo số thực cho weight
+        # Đảm bảo supcon_loss_weight luôn có giá trị float (fallback = supcon_gain).
         gain = float(getattr(self.hyp, "supcon_gain", 2.5))
         w = getattr(self.hyp, "supcon_loss_weight", None)
-        if w is None:
-            w = gain
         try:
-            w = float(w)
+            w = float(w if w is not None else gain)
         except (TypeError, ValueError):
             w = gain
         setattr(self.hyp, "supcon_loss_weight", w)
 
-        # Bật/tắt, chọn feat
-        if getattr(self.hyp, "supcon_feat", None) in (None, ""):
+        # Mặc định dùng feature "stn" nếu chưa set
+        if not getattr(self.hyp, "supcon_feat", None):
             setattr(self.hyp, "supcon_feat", "stn")
 
-        # Mirror ngược để nơi khác không thấy None
+        # Mirror toàn bộ hyp về model.args (SimpleNamespace)
         if getattr(self.model, "args", None) is None or isinstance(self.model.args, dict):
             self.model.args = SimpleNamespace(**(getattr(self.model, "args", {}) or {}))
         for k in _SUPCON_KEYS:
             if hasattr(self.hyp, k):
                 setattr(self.model.args, k, getattr(self.hyp, k))
 
-    def _normalize_and_mirror_supcon(self, from_env=False):
-        # Copy từ model.args -> self.hyp
+    def _normalize_and_mirror_supcon(self, from_env: bool = False):
         self._merge_from_model_args()
-        # Copy từ ENV nếu muốn
         if from_env:
             self._merge_from_env()
-        # Chốt giá trị cuối cùng và mirror ngược
         self._finalize_supcon()
 
-    # --------------------- SupCon: memory queue helpers ---------------------
+    # ============================ Memory queue utils ========================= #
+    def supcon_reset_queue(self):
+        """Gọi khi chuyển OFF->ON để tránh kéo rác/nhãn cũ."""
+        self._mq_feats = None
+        self._mq_labels = None
+        self._mq_ptr = 0
+        self._mq_ready = False
+
+    @torch.no_grad()
+    def _mq_ensure(self, cdim: int):
+        """Đảm bảo queue tồn tại và đúng kích thước (zero-init)."""
+        qsize = int(getattr(self.hyp, "supcon_queue", self._mq_size))
+        if (self._mq_feats is None) or (self._mq_feats.size(0) != qsize) or (self._mq_feats.size(1) != cdim):
+            self._mq_size = qsize
+            self._mq_feats = torch.zeros((qsize, cdim), dtype=torch.float16, device="cpu")  # ZERO INIT
+            self._mq_labels = torch.full((qsize,), -1, dtype=torch.long, device="cpu")
+            self._mq_ptr = 0
+            self._mq_ready = False
+
     @torch.no_grad()
     def _mq_enqueue(self, feats: torch.Tensor, labels: torch.Tensor):
-        if self._mq_size <= 0 or feats is None or feats.numel() == 0:
+        """Đưa (feats, labels) vào queue; chỉ nhận label >= 0 (positives)."""
+        if feats is None or feats.numel() == 0 or labels is None or labels.numel() == 0:
             return
-        N, C = feats.shape
-        if self._mq_feats is None:
-            self._mq_feats = torch.zeros(self._mq_size, C, device=self.device, dtype=feats.dtype)
-            self._mq_labels = torch.full((self._mq_size,), -1, device=self.device, dtype=labels.dtype)
-            self._mq_ptr = 0
+        labels = labels.view(-1)
+        pos = labels.ge(0)
+        if not pos.any():
+            return
 
-        end = self._mq_ptr + N
-        if end <= self._mq_size:
-            self._mq_feats[self._mq_ptr:end] = feats
-            self._mq_labels[self._mq_ptr:end] = labels
+        feats = feats[pos].contiguous()
+        labels = labels[pos].contiguous()
+        N, C = feats.shape
+        self._mq_ensure(C)
+
+        ptr = int(self._mq_ptr)
+        qsize = int(self._mq_size)
+        end = ptr + N
+
+        feats_cpu = feats.to("cpu", non_blocking=True).half()
+        labels_cpu = labels.to("cpu", non_blocking=True)
+
+        if end <= qsize:
+            self._mq_feats[ptr:end] = feats_cpu
+            self._mq_labels[ptr:end] = labels_cpu
         else:
-            first = self._mq_size - self._mq_ptr
+            first = qsize - ptr
             if first > 0:
-                self._mq_feats[self._mq_ptr:] = feats[:first]
-                self._mq_labels[self._mq_ptr:] = labels[:first]
+                self._mq_feats[ptr:] = feats_cpu[:first]
+                self._mq_labels[ptr:] = labels_cpu[:first]
             rest = N - first
             if rest > 0:
-                self._mq_feats[:rest] = feats[first:]
-                self._mq_labels[:rest] = labels[first:]
-        self._mq_ptr = (self._mq_ptr + N) % self._mq_size
+                self._mq_feats[:rest] = feats_cpu[first:first + rest]
+                self._mq_labels[:rest] = labels_cpu[first:first + rest]
+
+        self._mq_ptr = (ptr + N) % qsize
         if not self._mq_ready and self._mq_ptr == 0:
             self._mq_ready = True
 
+    # =============================== SupCon loss ============================ #
     def _supcon_loss_memory(self, z: torch.Tensor, y: torch.Tensor, T: float):
+        """
+        SupCon với memory queue + tùy chọn BG:
+          - anchors = z[y>=0]
+          - keys    = anchors_detach (+ bg_detach nếu có) + queue (giới hạn supcon_neg_cap)
+
+        Trả về: loss (scalar).
+        Ghi:     self._supcon_prob = mean(exp(num - den)) để theo dõi “độ dễ”.
+        """
         if z is None or z.numel() == 0:
             return None
-        z = F.normalize(z, dim=1)
-        y = y.view(-1).long()
-        B = z.size(0)
 
-        keys = z.detach()
-        klabels = y.detach()
+        device = z.device
+        y = y.view(-1).long()
+
+        # (1) Tách anchors dương và "bg" (label=-1)
+        a_mask = y.ge(0)
+        if a_mask.sum() == 0:
+            return None
+        z_a = z[a_mask]
+        y_a = y[a_mask]
+        z_bg = z[~a_mask] if (~a_mask).any() else None
+
+        # (2) Chuẩn hoá anchors
+        z_a = _safe_normalize(z_a)
+
+        # (3) Đảm bảo queue tồn tại
+        self._mq_ensure(z.size(1))
+
+        # (4) Build keys: anchors_detach + (bg_detach) + (queue hợp lệ)
+        keys_list, klabels_list = [z_a.detach()], [y_a]
+        if z_bg is not None and z_bg.numel() > 0:
+            keys_list.append(z_bg.detach())
+            klabels_list.append(torch.full((z_bg.size(0),), -1, dtype=torch.long, device=y.device))
 
         if int(getattr(self.hyp, "supcon_use_mem", 1)) and (self._mq_feats is not None):
             valid = self._mq_labels.ge(0)
             if valid.any():
-                keys = torch.cat([keys, self._mq_feats[valid]], dim=0)
-                klabels = torch.cat([klabels, self._mq_labels[valid]], dim=0)
+                mq_feats = self._mq_feats[valid].to(device, non_blocking=True)
+                mq_labs = self._mq_labels[valid].to(device, non_blocking=True)
+                keys_list.append(mq_feats)
+                klabels_list.append(mq_labs)
 
-        K = keys.size(0)
-        if K == 0:
+        keys = torch.cat(keys_list, dim=0)
+        klabels = torch.cat(klabels_list, dim=0)
+
+        # Lọc hàng không-finite
+        finite = torch.isfinite(keys).all(dim=1)
+        if not finite.any():
             return None
+        keys = keys[finite]
+        klabels = klabels[finite]
 
-        logits = (z @ keys.t()) / float(T)
-        same = y.view(-1, 1).eq(klabels.view(1, -1))
+        # (5) Giới hạn tổng số keys (ưu tiên giữ anchors/bg)
+        K_cap = int(getattr(self.hyp, "supcon_neg_cap", 2048))
+        if K_cap > 0 and keys.size(0) > K_cap:
+            base = z_a.size(0) + (z_bg.size(0) if z_bg is not None else 0)
+            base = min(base, keys.size(0))
+            remain = keys.size(0) - base
+            take = max(0, K_cap - base)
+            if take < remain:
+                idx_rem = torch.randperm(remain, device=device)[:take] + base
+                idx_all = torch.cat([torch.arange(base, device=device), idx_rem], 0)
+                keys = keys[idx_all]
+                klabels = klabels[idx_all]
 
-        if K >= B:
-            idx = torch.arange(B, device=logits.device)
-            logits[idx, idx] = -float("inf")
-            same[idx, idx] = False
+        # (6) Tính logits ở fp32 + căn giữa từng hàng
+        keys = _safe_normalize(keys)
+        logits = (z_a.float() @ keys.float().t()) / float(T)  # [Ba, K]
+        Ba, K = logits.shape
 
-        pos_cnt = same.sum(1)
-        valid_anchor = pos_cnt > 0
+        # (7) Tạo mask pos/neg + bỏ self-pairs
+        pos_mask = y_a.view(-1, 1).eq(klabels.view(1, -1)) & klabels.view(1, -1).ge(0)
+        logits_mask = torch.ones_like(logits, dtype=torch.bool)
+        if K >= Ba:
+            idx = torch.arange(Ba, device=device)
+            logits_mask[idx, idx] = False
+        neg_mask = logits_mask & (~pos_mask)
+
+        # (8) Centering theo hàng (ổn định số học)
+        logits = logits - logits.max(dim=1, keepdim=True).values
+
+        # (9) Âm weight: lambda_neg ~ (neg_per_pos * p)/n (log-space add)
+        same_f = pos_mask.to(logits.dtype)
+        mask_f = logits_mask.to(logits.dtype)
+        p = same_f.sum(dim=1).clamp(min=1.0)
+        n = (mask_f - same_f).sum(dim=1).clamp(min=1.0)
+
+        neg_per_pos = float(getattr(self.hyp, "supcon_neg_per_pos", 2.0))
+        min_neg_w = float(getattr(self.hyp, "supcon_min_neg_w", 1e-3))
+        lambda_neg = torch.minimum(torch.ones_like(p, dtype=logits.dtype),
+                                   (neg_per_pos * p) / n).clamp(min=min_neg_w)
+        log_w_neg = torch.log(lambda_neg).unsqueeze(1)
+
+        logits_w = torch.where(neg_mask, logits + log_w_neg, logits)
+        logits_w = torch.where(logits_mask, logits_w, torch.full_like(logits_w, float('-inf')))
+
+        # (10) InfoNCE với log-sum-exp
+        pos_only = torch.where(pos_mask, logits_w, torch.full_like(logits_w, float('-inf')))
+        valid_anchor = pos_mask.any(dim=1)
+        self._last_valid_anchor = int(valid_anchor.sum().item())
         if not valid_anchor.any():
-            self._supcon_stat["pos_batch"] = 0
             return None
 
-        log_den = torch.logsumexp(logits, dim=1)
-        pos_logits = torch.where(same, logits, logits.new_full(logits.shape, -float("inf")))
-        log_num = torch.logsumexp(pos_logits, dim=1)
-        loss = (-(log_num - log_den))[valid_anchor].mean()
+        num = torch.logsumexp(pos_only[valid_anchor], dim=1)
+        den = torch.logsumexp(logits_w[valid_anchor], dim=1)
+        loss = -(num - den).mean()
 
-        self._supcon_stat["pos_batch"] = int(valid_anchor.sum().item())
+        with torch.no_grad():
+            self._supcon_prob = torch.exp(num - den).mean().clamp(0.0, 1.0)
+
+        # Fallback hiếm khi loss bất thường
+        if not torch.isfinite(loss) or loss.abs() < 1e-12:
+            logits_fb = torch.where(logits_mask, logits, torch.full_like(logits, float('-inf')))
+            pos_fb = torch.where(pos_mask, logits_fb, torch.full_like(logits_fb, float('-inf')))
+            num_fb = torch.logsumexp(pos_fb[valid_anchor], dim=1)
+            den_fb = torch.logsumexp(logits_fb[valid_anchor], dim=1)
+            loss_fb = -(num_fb - den_fb).mean()
+            if torch.isfinite(loss_fb):
+                loss = loss_fb
+                with torch.no_grad():
+                    self._supcon_prob = torch.exp(num_fb - den_fb).mean().clamp(0.0, 1.0)
+
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # (11) Enqueue anchors dương (đã chuẩn hoá)
+        with torch.no_grad():
+            self._mq_enqueue(_safe_normalize(z_a.detach().float()), y_a.detach())
+
+        # (12) Log MEM (throttle theo epoch)
+        if int(getattr(self.hyp, "supcon_log", 1)) == 1 and self._mem_log_cnt < self._max_logs:
+            try:
+                pos_pairs = int(pos_mask.sum().item())
+                neg_pairs = int(neg_mask.sum().item())
+                anchors = int(valid_anchor.sum().item())
+                keys_pos = int((klabels >= 0).sum().item())
+                keys_bg  = int((klabels == -1).sum().item())
+                base_keys = z_a.size(0) + (z_bg.size(0) if z_bg is not None else 0)
+                keys_mem_est = max(0, int(keys.size(0) - base_keys))
+                ln_mean = float(lambda_neg.mean().item())
+                valf = float(self._supcon_prob) if self._supcon_prob is not None else None
+                LOGGER.info(
+                    f"[SupConStat/mem] pos_pairs={pos_pairs} neg_pairs={neg_pairs} "
+                    f"anchors={anchors} keys_pos={keys_pos} keys_bg={keys_bg} keys_mem≈{keys_mem_est} "
+                    f"ln_mean={ln_mean:.4f} val={valf}"
+                )
+                self._mem_log_cnt += 1
+            except Exception:
+                pass
+
         return loss
 
     def _supcon_loss(self, z: torch.Tensor, y: torch.Tensor, T: float):
+        """SupCon nội-batch (fallback khi chưa có queue)."""
         if z is None or z.numel() == 0:
             return None
-        z = F.normalize(z, dim=1)
+        z = _safe_normalize(z)
         y = y.view(-1).long()
         B = z.size(0)
+
         logits = (z @ z.t()) / float(T)
         idx = torch.arange(B, device=z.device)
         logits[idx, idx] = -float("inf")
+
         same = y.view(-1, 1).eq(y.view(1, -1))
-        pos_cnt = same.sum(1)
-        valid_anchor = pos_cnt > 0
+        pos_mask = same & y.view(-1, 1).ge(0) & y.view(1, -1).ge(0)
+        pos_cnt = pos_mask.sum(1)
+        valid_anchor = (pos_cnt > 0) & y.ge(0)
         if not valid_anchor.any():
             return None
+
         log_den = torch.logsumexp(logits, dim=1)
-        pos_logits = torch.where(same, logits, logits.new_full(logits.shape, -float("inf")))
+        pos_logits = torch.where(pos_mask, logits, logits.new_full(logits.shape, -float("inf")))
         log_num = torch.logsumexp(pos_logits, dim=1)
         return (-(log_num - log_den))[valid_anchor].mean()
 
-    # --------------------- YOLO helpers ---------------------
+    # ============================= YOLOv8 helpers ============================ #
     def set_theta(self, theta: torch.Tensor):
+        """Callback từ STN: nhận theta (B×2×3) và lưu vào loss."""
         self.theta_for_loss = theta.detach() if theta is not None else None
 
+    def _after_hook(self, _module, _inp, out):
+        """Hook ngay sau STN: ghi feature map 4D có đủ kênh để ROIAlign."""
+        if torch.is_tensor(out) and out.dim() == 4 and out.shape[1] >= self._aft_min_channels:
+            self._aft_last = out  # giữ nguyên tensor (gradient đi qua)
+
     def preprocess(self, targets, batch_size, scale_tensor):
+        """Ghép targets theo batch + convert xywh->xyxy (đã fix scale_tensor shape W,H,W,H)."""
         nl, ne = targets.shape
         if nl == 0:
             out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
@@ -424,172 +571,230 @@ class v8DetectionLoss:
                 matches = i == j
                 if n := matches.sum():
                     out[j, :n] = targets[matches, 1:]
-            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+        scale_tensor_full = scale_tensor[[1, 0, 1, 0]]  # [H,W] -> [W,H,W,H]
+        out[..., 1:5] = xywh2xyxy(out[..., 1:5] * scale_tensor_full)
         return out
 
     def bbox_decode(self, anchor_points, pred_dist):
+        """DFL decode an toàn (fp32 + nan_to_num + contiguous/view)."""
         if self.use_dfl:
+            pred_dist = torch.nan_to_num(pred_dist, nan=0.0, posinf=0.0, neginf=0.0)
             b, a, c = pred_dist.shape
-            pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+            try:
+                x = pred_dist.contiguous().view(b, a, 4, c // 4)
+                x32 = x.float().softmax(3)
+                pred_dist = x32.matmul(self.proj.float())
+            except Exception as e:
+                LOGGER.warning(f"[DFL decode] fallback due to {e}")
+                x = pred_dist.reshape(b, a, 4, max(1, c // 4)).float()
+                pred_dist = x.softmax(3).matmul(self.proj.float())
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
-    def _after_hook(self, _m, _inp, out):
-        # Lấy fmap 4D, đủ sâu (C>=_aft_min_channels), giữ grad để SupCon backprop
-        if torch.is_tensor(out) and out.dim() == 4 and out.shape[1] >= self._aft_min_channels:
-            self._aft_last = out
-
-    # --------------------- Forward ---------------------
+    # ================================ Forward =============================== #
     def __call__(self, preds, batch):
-        from torchvision.ops import roi_align
-
-        # Trước mỗi forward: REFRESH cấu hình (đọc lại model.args/ENV nếu callback vừa bơm)
+        # Đồng bộ hyp mỗi lần (cho phép callback/ENV thay đổi động)
         self._normalize_and_mirror_supcon(from_env=True)
-
         if not self._printed_hyp:
-            LOGGER.info(f"[LOSS/HYP effective] on={getattr(self.hyp,'supcon_on',0)}, "
-                        f"feat={getattr(self.hyp,'supcon_feat',None)}, "
-                        f"w={getattr(self.hyp,'supcon_loss_weight',None)}, "
-                        f"gain={getattr(self.hyp,'supcon_gain',None)}")
+            LOGGER.info(
+                f"[LOSS/HYP effective] on={getattr(self.hyp, 'supcon_on', 0)}, "
+                f"feat={getattr(self.hyp, 'supcon_feat', None)}, "
+                f"w={getattr(self.hyp, 'supcon_loss_weight', None)}, "
+                f"gain={getattr(self.hyp, 'supcon_gain', None)}"
+            )
             self._printed_hyp = True
 
-        # đọc cấu hình
-        cfg = SimpleNamespace(
-            on=int(getattr(self.hyp, "supcon_on", 0) or 0),
-            feat=str(getattr(self.hyp, "supcon_feat", "stn")).lower(),
-            warp=int(getattr(self.hyp, "supcon_warp_gt", 0)),
-            out=int(getattr(self.hyp, "supcon_out", 7)),
-            min_box=int(getattr(self.hyp, "supcon_min_box", 1)),
-            max_pc=int(getattr(self.hyp, "supcon_max_per_class", 0)),
-            temp=float(getattr(self.hyp, "supcon_temp", 0.2)),
-            gain=float(getattr(self.hyp, "supcon_gain", 2.5)),
-            warmup=int(getattr(self.hyp, "supcon_warmup", 0)),
-            use_mem=int(getattr(self.hyp, "supcon_use_mem", 1)),
-            proj_dim=int(getattr(self.hyp, "supcon_proj_dim", 0)),
-            proj_hidden=int(getattr(self.hyp, "supcon_proj_hidden", 0)),
-            proj_bn=int(getattr(self.hyp, "supcon_proj_bn", 1)),
-            log=int(getattr(self.hyp, "supcon_log", 0)),
-        )
+        # Reset throttle log khi sang epoch mới
+        cur_epoch = getattr(self, "epoch", -1)
+        if cur_epoch != self._log_epoch:
+            self._log_epoch = cur_epoch
+            self._mem_log_cnt = 0
+            self._roi_log_cnt = 0
 
-        # parse YOLO preds
-        loss = torch.zeros(3, device=self.device)
-        self._supcon_val = None
-        self._supcon_stat = {}
+        # ---- Lấy head outputs ----
+        feats = preds[1] if isinstance(preds, tuple) else preds  # (P3,P4,P5)
+        B = feats[0].shape[0]
+        dtype = feats[0].dtype
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
 
-        feats = preds[1] if isinstance(preds, tuple) else preds  # [P3,P4,P5]
-        pred_distri, pred_scores = torch.cat(
-            [xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2
-        ).split((self.reg_max * 4, self.nc), 1)
+        pred_distri, pred_scores = torch.cat([xi.view(B, self.no, -1) for xi in feats], 2) \
+            .split((self.reg_max * 4, self.nc), 1)
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
 
-        dtype = pred_scores.dtype
-        B = pred_scores.shape[0]
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
-        # targets
-        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
-        targets = self.preprocess(targets.to(self.device), B, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)
-        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+        # ---- Chuẩn bị GT ----
+        batch_idx = batch["batch_idx"].view(-1, 1)
+        targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        gt_all = self.preprocess(targets, B, imgsz)
+        gt_labels = gt_all[:, :, :1]
+        gt_bboxes = gt_all[:, :, 1:5]
+        mask_gt = gt_labels.ge(0)
 
-        # --- SupCon (ROI từ fmap SAU STN; fallback P3)
-        if cfg.on:
+        # ============================== SUPCON ============================== #
+        self._supcon_val = None
+        self._supcon_prob = None
+
+        if self.model.training and int(getattr(self.hyp, "supcon_on", 0)):
             try:
-                # chọn feature map
-                if cfg.feat == "stn" and (self._aft_last is not None):
+                # Chọn feature cho ROIAlign
+                if str(getattr(self.hyp, "supcon_feat", "stn")).lower() == "stn" and (getattr(self, "_aft_last", None) is not None):
                     feat_map, src = self._aft_last, "after_stn"
                 else:
                     feat_map, src = feats[0], "p3"
 
-                valid = mask_gt.squeeze(-1)
+                valid = mask_gt.squeeze(-1)  # [B, max_gt]
                 if valid.any():
                     b_idx, m_idx = valid.nonzero(as_tuple=False).T
                     boxes_bm = gt_bboxes.detach().clone()
 
-                    # warp GT theo theta ngược nếu đang dùng fmap sau STN
-                    if cfg.warp and (self.theta_for_loss is not None) and (src == "after_stn"):
+                    # Warp ngược GT nếu dùng feature sau STN
+                    if int(getattr(self.hyp, "supcon_warp_gt", 0)) and (getattr(self, "theta_for_loss", None) is not None) and (src == "after_stn"):
                         boxes_bm = self.warp_bbox(boxes_bm, self.theta_for_loss, imgsz)
 
-                    boxes = boxes_bm[b_idx, m_idx]                # [N,4] xyxy px
-                    labels = gt_labels[b_idx, m_idx, 0].long()    # [N]
+                    boxes = boxes_bm[b_idx, m_idx]          # [N,4] xyxy
+                    labels = gt_labels[b_idx, m_idx, 0].long()
 
-                    # bỏ bbox quá nhỏ + giới hạn per-class
+                    # Lọc ROI nhỏ
                     wh = boxes[:, 2:] - boxes[:, :2]
-                    keep = (wh[:, 0] >= cfg.min_box) & (wh[:, 1] >= cfg.min_box)
+                    keep = (wh[:, 0] >= int(getattr(self.hyp, "supcon_min_box", 1))) & (wh[:, 1] >= int(getattr(self.hyp, "supcon_min_box", 1)))
                     if keep.any():
                         boxes, labels, b_keep = boxes[keep], labels[keep], b_idx[keep]
-                        if cfg.max_pc > 0:
+
+                        # Giới hạn mỗi class (nếu set)
+                        max_pc = int(getattr(self.hyp, "supcon_max_per_class", 0))
+                        if max_pc > 0:
                             uniq = labels.unique(sorted=True)
-                            sel = []
+                            sel_idx = []
                             for c in uniq.tolist():
                                 idxc = torch.nonzero(labels == c, as_tuple=False).view(-1)
-                                sel.append(idxc[:cfg.max_pc] if idxc.numel() > cfg.max_pc else idxc)
-                            if sel:
-                                idxs = torch.cat(sel)
+                                sel_idx.append(idxc[:max_pc] if idxc.numel() > max_pc else idxc)
+                            if sel_idx:
+                                idxs = torch.cat(sel_idx)
                                 boxes, labels, b_keep = boxes[idxs], labels[idxs], b_keep[idxs]
 
+                        # (Tuỳ chọn) thêm BG ROI từ ảnh pair
+                        bg_add = 0
+                        pair_idx = batch.get("pair_idx", None)
+                        abn_mask = batch.get("abn_mask", None)
+                        if pair_idx is not None and abn_mask is not None:
+                            pair_idx = torch.as_tensor(pair_idx, device=boxes.device) if not torch.is_tensor(pair_idx) else pair_idx
+                            abn_mask = torch.as_tensor(abn_mask, device=boxes.device).bool() if not torch.is_tensor(abn_mask) else abn_mask.bool()
+                            for (i, j) in pair_idx.tolist():
+                                if bool(abn_mask[i]) and not bool(abn_mask[j]):
+                                    fg, bg = i, j
+                                elif bool(abn_mask[j]) and not bool(abn_mask[i]):
+                                    fg, bg = j, i
+                                else:
+                                    continue
+                                sel_fg = (b_keep == fg)
+                                if not torch.any(sel_fg):
+                                    continue
+                                b_fg = boxes[sel_fg]
+                                lbl_bg = torch.full((b_fg.size(0),), -1, device=labels.device, dtype=labels.dtype)
+                                boxes = torch.cat([boxes, b_fg], dim=0)
+                                labels = torch.cat([labels, lbl_bg], dim=0)
+                                b_keep = torch.cat([b_keep, torch.full((b_fg.size(0),), bg, device=b_keep.device, dtype=b_keep.dtype)], dim=0)
+                                bg_add += int(b_fg.size(0))
+
+                        # ROIAlign
                         if boxes.numel() > 0:
-                            # ảnh -> fmap
                             H, W = int(imgsz[0].item()), int(imgsz[1].item())
                             _, Cf, Hf, Wf = feat_map.shape
+
                             x1, y1, x2, y2 = boxes.unbind(1)
                             x1 = x1.clamp(0, W - 1); y1 = y1.clamp(0, H - 1)
                             x2 = torch.maximum(x2.clamp(0, W - 1), x1 + 1)
                             y2 = torch.maximum(y2.clamp(0, H - 1), y1 + 1)
                             boxes = torch.stack([x1, y1, x2, y2], 1)
+
+                            b_keep = b_keep.clamp_min(0).clamp_max(B - 1)
                             sx, sy = Wf / float(W), Hf / float(H)
                             fx1, fy1 = boxes[:, 0] * sx, boxes[:, 1] * sy
                             fx2, fy2 = boxes[:, 2] * sx, boxes[:, 3] * sy
-                            rois = torch.stack([b_keep.float(), fx1.float(), fy1.float(), fx2.float(), fy2.float()],
-                                               1).to(feat_map.device, feat_map.dtype)
+                            rois = torch.stack([b_keep.float(), fx1.float(), fy1.float(), fx2.float(), fy2.float()], 1)\
+                                   .to(feat_map.device, feat_map.dtype)
 
-                            pooled = roi_align(
-                                input=feat_map, boxes=rois,
-                                output_size=(cfg.out, cfg.out),
-                                spatial_scale=1.0, sampling_ratio=0, aligned=True
-                            )
-                            z = pooled.mean(dim=(2, 3))  # [N,C]
+                            pooled = roi_align(input=feat_map, boxes=rois,
+                                               output_size=(int(getattr(self.hyp, "supcon_out", 7)),
+                                                            int(getattr(self.hyp, "supcon_out", 7))),
+                                               spatial_scale=1.0, sampling_ratio=0, aligned=True)
+                            z = pooled.mean(dim=(2, 3))  # [N, C]
+                            z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
 
-                            # projection head (lazy)
-                            if cfg.proj_dim > 0:
-                                if self._proj_head is None:
-                                    self._proj_head = SupConProjection(
-                                        out_dim=cfg.proj_dim,
-                                        hidden=cfg.proj_hidden,
-                                        bn=bool(cfg.proj_bn)
-                                    ).to(self.device)
-                                    # để optimizer bên ngoài có thể add params
+                            # Projection head (lazy init, fp32)
+                            proj_dim = int(getattr(self.hyp, "supcon_proj_dim", 0))
+                            if proj_dim > 0:
+                                if getattr(self, "_proj_head", None) is None:
+                                    in_dim = int(z.shape[1])
+                                    hid = int(getattr(self.hyp, "supcon_proj_hidden", 0)) or max(128, in_dim)
+                                    self._proj_head = SupConProjection(in_dim=in_dim, hidden=hid,
+                                                                       out_dim=proj_dim,
+                                                                       bn=int(getattr(self.hyp, "supcon_proj_bn", 1)))\
+                                                      .to(device=z.device, dtype=torch.float32)
                                     setattr(self.model, "supcon_proj", self._proj_head)
-                                    LOGGER.info(f"[SupConProj] created (lazy): out_dim={cfg.proj_dim}, "
-                                                f"hidden={cfg.proj_hidden}, bn={bool(cfg.proj_bn)}")
-                                z = self._proj_head(z)
+                                    LOGGER.info(f"[SupConProj] created (in_dim={in_dim}, out_dim={proj_dim}, "
+                                                f"hidden={hid}, bn={int(getattr(self.hyp,'supcon_proj_bn',1))})")
+                                self._proj_head = self._proj_head.to(device=z.device, dtype=torch.float32)
+                                z = self._proj_head(z.float())
 
-                            mem_valid = int(self._mq_labels.ge(0).sum().item()) if (self._mq_labels is not None) else 0
-                            self._supcon_stat.update({"used": src, "roi": int(z.size(0)), "mem_valid": mem_valid})
+                            z = _safe_normalize(z)
 
-                            # compute supcon loss (ưu tiên memory)
-                            loss_mem = self._supcon_loss_memory(z, labels, cfg.temp)
-                            loss_batch = self._supcon_loss(z, labels, cfg.temp) if loss_mem is None else None
-                            self._supcon_val = loss_mem if (loss_mem is not None) else loss_batch
+                            # ---- LOG /roi (throttle theo epoch) ----
+                            mem_valid = int(self._mq_labels.ge(0).sum().item()) if (getattr(self, "_mq_labels", None) is not None) else 0
+                            self._supcon_stat.update({"used": src, "roi": int(z.size(0)), "mem_valid": mem_valid, "bg_roi": int(bg_add)})
 
+                            pos_mask = labels.ge(0)
+                            if int(getattr(self.hyp, "supcon_log", 1)) and self._roi_log_cnt < self._max_logs:
+                                try:
+                                    pos_anchors = int(pos_mask.sum().item())
+                                    neg_anchors = int((~pos_mask).sum().item())
+                                    va = int(getattr(self, "_last_valid_anchor", -1))
+                                    valf = float(self._supcon_prob) if self._supcon_prob is not None else None
+                                    LOGGER.info(
+                                        f"[SupConStat/roi] src={src} pos_anchors={pos_anchors} "
+                                        f"neg_anchors={neg_anchors} valid_anchor={va} mem_valid={mem_valid} val={valf}"
+                                    )
+                                    self._roi_log_cnt += 1
+                                except Exception:
+                                    pass
+
+                            # ---- Ưu tiên memory; fallback batch-only ----
+                            num_pos = int(pos_mask.sum().item())
+                            if num_pos >= 1:
+                                z_pos = z[pos_mask]
+                                y_pos = labels[pos_mask]
+                                loss_mem = self._supcon_loss_memory(z_pos, y_pos, float(getattr(self.hyp, "supcon_temp", 0.5)))
+                                loss_batch = self._supcon_loss(z_pos, y_pos, float(getattr(self.hyp, "supcon_temp", 0.5))) if (loss_mem is None and num_pos >= 2) else None
+                                self._supcon_val = loss_mem if (loss_mem is not None) else loss_batch
+                            else:
+                                self._supcon_val = None
+
+                            # Phòng hờ enqueue (thực ra _supcon_loss_memory đã enqueue)
                             with torch.no_grad():
-                                self._mq_enqueue(F.normalize(z, dim=1).detach(), labels.detach())
-                # else: no valid targets -> supcon skipped
+                                if num_pos > 0:
+                                    self._mq_enqueue(z[pos_mask].detach().float(), labels[pos_mask].detach())
             except Exception as e:
                 LOGGER.warning(f"[SupCon] EXCEPTION: {e}")
                 self._supcon_val = None
-                self._supcon_stat.update({"used": "err", "roi": 0, "pos_batch": 0, "mem_valid": 0, "val": None})
+                self._supcon_prob = None
+                self._supcon_stat.update({"used": "err", "roi": 0, "mem_valid": 0, "bg_roi": 0})
+        # ============================ END SUPCON ============================= #
 
-        # --- YOLO base losses
+        # ---- Detector losses ----
+        pred_distri = torch.nan_to_num(pred_distri, nan=0.0, posinf=0.0, neginf=0.0)
+        pred_scores = torch.nan_to_num(pred_scores, nan=0.0, posinf=0.0, neginf=0.0)
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
             gt_labels, gt_bboxes, mask_gt,
         )
+
         target_scores_sum = max(target_scores.sum(), 1)
+        loss = torch.zeros(3, device=self.device)  # [box, cls, dfl]
 
         # cls
         loss[1] = self.bce(pred_scores, target_scores.to(pred_scores.dtype)).sum() / target_scores_sum
@@ -602,35 +807,51 @@ class v8DetectionLoss:
                 target_bboxes, target_scores, target_scores_sum, fg_mask
             )
 
-        # apply gains (an toàn nếu thiếu)
+        # Scale theo hyp
         loss[0] *= getattr(self.hyp, "box", 1.0)
         loss[1] *= getattr(self.hyp, "cls", 1.0)
         loss[2] *= getattr(self.hyp, "dfl", 1.0)
+        box_det_loss = loss[0].clone()
 
-        # add SupCon (weighted) — luôn an toàn với None
-        if int(getattr(self.hyp, "supcon_on", 0)) and (self._supcon_val is not None):
-            w = getattr(self.hyp, "supcon_loss_weight", None)
-            if w is None:
-                w = getattr(self.hyp, "supcon_gain", 2.5)
-            gain = float(w)
+        # STN regularizer (tuỳ chọn)
+        w_reg = float(getattr(self.hyp, "stn_reg", 0.05))
+        if (w_reg > 0.0) and (getattr(self, "theta_for_loss", None) is not None):
+            loss[0] = loss[0] + w_reg * self._stn_regularizer(self.theta_for_loss)
 
+        # Cộng SupCon (nếu có)
+        if self.model.training and int(getattr(self.hyp, "supcon_on", 0)) and (self._supcon_val is not None):
+            gain = float(getattr(self.hyp, "supcon_loss_weight", getattr(self.hyp, "supcon_gain", 1.0)))
             warm = int(getattr(self.hyp, "supcon_warmup", 0))
             if warm and hasattr(self, "epoch"):
                 gain *= min(1.0, float(self.epoch + 1) / float(warm))
+            sv = torch.nan_to_num(self._supcon_val, nan=0.0, posinf=0.0, neginf=0.0)
+            loss[0] = loss[0] + gain * sv
 
-            loss[0] = loss[0] + gain * self._supcon_val
+        # Cột 4 để log supcon_loss ra tqdm
+        supcon_log = torch.zeros((), device=loss.device)
+        if self._supcon_val is not None:
+            supcon_log = torch.nan_to_num(self._supcon_val.detach(), nan=0.0, posinf=0.0, neginf=0.0)
 
-        supcon_display = (
-            torch.nan_to_num(self._supcon_val.detach(), nan=0.0, posinf=50.0, neginf=0.0)
-            if (int(getattr(self.hyp, "supcon_on", 0)) and (self._supcon_val is not None)) else
-            torch.zeros((), device=loss.device)
-        )
-        loss_items = torch.stack((loss[0].detach(), loss[1].detach(), loss[2].detach(), supcon_display))
-        total = loss.sum()
-        return total, loss_items
+        # Log status tổng quát (tối đa 3 lần/epoch)
+        if int(getattr(self.hyp, "supcon_log", 1)):
+            _cnt = getattr(self, "_supcon_log_cnt", 0)
+            if cur_epoch != getattr(self, "_supcon_log_epoch", None):
+                self._supcon_log_epoch = cur_epoch
+                _cnt = 0
+            if _cnt < 3:
+                val_repr = "NONE" if self._supcon_prob is None else f"{float(self._supcon_prob):.4f}"
+                LOGGER.info(f"[SupCon/log] e={-1 if cur_epoch is None else cur_epoch} "
+                            f"on={int(getattr(self.hyp, 'supcon_on', 0))} val={val_repr}")
+                _cnt += 1
+            self._supcon_log_cnt = _cnt
 
-    # --------------------- warp bbox bằng affine ngược của STN ---------------------
+        loss_items = torch.stack((box_det_loss.detach(), loss[1].detach(), loss[2].detach(), supcon_log))
+        total_loss = loss.sum()
+        return total_loss, loss_items
+
+    # ============================= Phụ trợ khác ============================= #
     def warp_bbox(self, gt_bboxes: torch.Tensor, theta: torch.Tensor, imgsz: torch.Tensor) -> torch.Tensor:
+        """Warp GT bboxes theo affine nghịch của STN để khớp hệ toạ độ sau STN."""
         if theta is None:
             return gt_bboxes
         B, M, _ = gt_bboxes.shape
@@ -638,28 +859,37 @@ class v8DetectionLoss:
         x1, y1, x2, y2 = gt_bboxes.unbind(-1)
         xs = torch.stack([x1, x2, x2, x1], dim=-1)
         ys = torch.stack([y1, y1, y2, y2], dim=-1)
-
         x_norm = (xs / (W - 1)) * 2 - 1
         y_norm = (ys / (H - 1)) * 2 - 1
-
         ones = torch.ones_like(x_norm)
-        pts = torch.stack([x_norm, y_norm, ones], dim=1)   # [B,3,M,4]
+        pts = torch.stack([x_norm, y_norm, ones], dim=1)             # [B, 3, M*4]
         pts_flat = pts.view(B, 3, M * 4)
-
         bottom = torch.tensor([0, 0, 1], device=theta.device, dtype=theta.dtype).view(1, 1, 3).expand(B, 1, 3)
-        full_affine = torch.cat([theta.to(theta.dtype), bottom], dim=1)  # [B,3,3]
+        full_affine = torch.cat([theta.to(theta.dtype), bottom], dim=1)
         inv_affine = torch.inverse(full_affine)[:, :2, :]
-
         warped = inv_affine.bmm(pts_flat).view(B, 2, M, 4).permute(0, 2, 3, 1)
         xw = (warped[..., 0] + 1) / 2 * (W - 1)
         yw = (warped[..., 1] + 1) / 2 * (H - 1)
-
         x_min = xw.min(dim=-1).values.clamp(0, W - 1)
         y_min = yw.min(dim=-1).values.clamp(0, H - 1)
         x_max = xw.max(dim=-1).values.clamp(1, W)
         y_max = yw.max(dim=-1).values.clamp(1, H)
         return torch.stack([x_min, y_min, x_max, y_max], dim=-1)
 
+    def _stn_regularizer(self, theta: torch.Tensor) -> torch.Tensor:
+        """
+        Regular hoá theta gần Identity để tránh “giật” khi STN mới mở:
+        J = ||M - I||_F^2 + 0.25 * ||t||^2, với theta = [M|t] (2x3).
+        """
+        if theta is None or not torch.is_tensor(theta):
+            return torch.zeros((), device=self.device)
+        T = theta.view(-1, 2, 3)
+        M = T[:, :, :2]
+        t = T[:, :, 2]
+        I = torch.eye(2, device=self.device).unsqueeze(0).expand_as(M)
+        loss_m = (M - I).pow(2).sum()
+        loss_t = (t).pow(2).sum()
+        return loss_m + 0.25 * loss_t
 # ----------------------------------------------------------------------(ntnhan.0705)
 
 class v8SegmentationLoss(v8DetectionLoss):
@@ -695,10 +925,9 @@ class v8SegmentationLoss(v8DetectionLoss):
             targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
             gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
             mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
-            # >>> ADD: warp GT cho detection loss <<<
             if (self.theta_for_loss is not None) and bool(getattr(self.hyp, "det_warp_gt", 1)):
                 gt_bboxes = self.warp_bbox(gt_bboxes, self.theta_for_loss, imgsz)
-            # <<< END ADD
+
         except RuntimeError as e:
             raise TypeError(
                 "ERROR ❌ segment dataset incorrectly formatted or not a segment dataset.\n"

@@ -527,7 +527,7 @@ def _infer_gt_labels_dir(trainer) -> Optional[Path]:
                 return cand
     # Fallback: scan thư mục 'valid/labels' dưới gốc data nếu có
     save_dir = Path(getattr(trainer, "save_dir", "runs"))
-    root = save_dir.parent if save_dir else Path(".")
+    root = save_dir.parent if save_dir else Path("..")
     for cand in [
         root / "datasets" / "valid" / "labels",
         root / "dataset"  / "valid" / "labels",
