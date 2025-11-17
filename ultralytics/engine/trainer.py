@@ -101,17 +101,47 @@ class BaseTrainer:
 
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         """Initialize the BaseTrainer class."""
-        # Load & normalize args
+        # --------- 1) Chuẩn hoá & LỌC overrides (bỏ các key research mà default.yaml không biết) ----------
+        if overrides is None:
+            overrides = {}
+        elif not isinstance(overrides, dict):
+            # trường hợp là SimpleNamespace hoặc tương đương
+            try:
+                overrides = dict(overrides)
+            except TypeError:
+                overrides = vars(overrides)
+
+        # Các key custom của pipeline STN/SupCon mà YOLO gốc không có trong default.yaml
+        custom_keys = {"stn_reg", "stn_grad_mult", "supcon_proj_lr"}
+        self._custom_overrides = {}
+        for k in list(overrides.keys()):
+            if k in custom_keys:
+                # cất riêng để dùng sau, không đưa vào get_cfg để tránh SyntaxError
+                self._custom_overrides[k] = overrides.pop(k)
+
+        # --------- 2) Gọi get_cfg như YOLO gốc (giờ overrides đã "sạch") ----------
         self.args = get_cfg(cfg, overrides)
         if isinstance(self.args, dict):
             self.args = SimpleNamespace(**self.args)
+
+        # Copy phần còn lại của overrides (CLI, main_stn, v.v.) vào self.args (giống YOLO gốc)
         if isinstance(overrides, dict):
             for k, v in overrides.items():
                 setattr(self.args, k, v)
 
-        # Resume training if applicable
+        # Gắn lại 3 key custom lên self.args để phần sau vẫn truy cập bình thường
+        for k, v in self._custom_overrides.items():
+            setattr(self.args, k, v)
+
+        # (tuỳ chọn) alias cho tiện debug
+        self.stn_reg = getattr(self.args, "stn_reg", 0.0)
+        self.stn_grad_mult = getattr(self.args, "stn_grad_mult", 0.2)
+        self.supcon_proj_lr = getattr(self.args, "supcon_proj_lr", 1e-3)
+
+        # --------- 3) Resume logic như cũ ----------
         self.check_resume(overrides)
 
+        # --------- 4) Phần còn lại giữ nguyên như trước ----------
         # Device selection and seed initialization
         self.device = select_device(self.args.device, self.args.batch)
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
@@ -1016,7 +1046,15 @@ class BaseTrainer:
         self.scaler.unscale_(self.optimizer)
 
         # --- ADD: scale + clip riêng cho STN, vẫn dùng 1 LR ---
-        stn_grad_mult = float(getattr(self.args, "stn_grad_mult", 0.2))  # hệ số < 1 => update nhẹ
+        import os
+        raw = getattr(self.args, "stn_grad_mult", None)
+        if raw is None:
+            raw = os.environ.get("STN_GRAD_MULT", 0.2)
+        try:
+            stn_grad_mult = float(raw)
+        except (TypeError, ValueError):
+            stn_grad_mult = 0.2  # fallback an toàn
+
         stn_params = []
         for m in self.model.modules():
             if isinstance(m, SpatialTransformer):
@@ -1024,6 +1062,7 @@ class BaseTrainer:
                     if p.grad is not None:
                         p.grad.mul_(stn_grad_mult)  # scale grad tại chỗ
                         stn_params.append(p)
+
 
         # clip “trust region” riêng cho STN (nhỏ hơn clip chung)
         if stn_params:

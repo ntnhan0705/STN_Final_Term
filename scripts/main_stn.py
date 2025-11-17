@@ -10,6 +10,7 @@ from ultralytics.utils import LOGGER
 from ultralytics.utils.stn_utils import (
     attach_callbacks,
     register_pairing,
+    register_val_trap_and_safety,
 )
 
 # ===================== Final-eval SAFE PATCH =====================
@@ -34,8 +35,6 @@ if _BaseT is None:
     raise RuntimeError("Ultralytics API changed: neither BaseTrainer nor Trainer found for patching.")
 _BaseT.final_eval = _final_eval_safe
 # ================================================================
-
-
 # ---------------- CLI ----------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="YOLO-STN + SupCon (đầy đủ callback từ stn_utils)")
@@ -54,17 +53,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--save", type=int, default=1)
     p.add_argument("--save_period", type=int, default=-1)
-    p.add_argument("--amp", type=int, default=1)
+    p.add_argument("--amp", type=int, default=0)
     p.add_argument("--name", type=str, default=None)
 
-    # STN schedule
-    p.add_argument("--freeze_epochs", type=int, default=10)
-    p.add_argument("--stn_warmup", type=int, default=3)
-    p.add_argument("--stn_tmax", type=float, default=0.20)
-    p.add_argument("--stn_smin", type=float, default=0.90)
-    p.add_argument("--stn_smax", type=float, default=1.10)
-    p.add_argument("--stn_val_identity", type=int, default=0)
-    p.add_argument("--stn_log", type=int, default=1)
+    # STN schedule (chỉ phần lịch & log)
+    p.add_argument("--freeze_epochs", type=int, default=10,
+                   help="số epoch đầu giữ STN ở chế độ identity (không học)")
+    p.add_argument("--stn_warmup", type=int, default=3,
+                   help="số epoch chuyển dần từ identity -> full STN")
+    p.add_argument("--stn_tmax", type=float, default=0.20,
+                   help="biên độ jitter affine tối đa (tỉ lệ theo chiều ảnh)")
+    p.add_argument("--stn_smin", type=float, default=0.90,
+                   help="scale tối thiểu cho STN")
+    p.add_argument("--stn_smax", type=float, default=1.10,
+                   help="scale tối đa cho STN")
+    p.add_argument("--stn_val_identity", type=int, default=0,
+                   help="1 => ép STN identity khi chạy validation")
+    p.add_argument("--stn_log", type=int, default=1,
+                   help="1 => log mode STN mỗi epoch")
+
+    # STN regularizer + STN grad scale
+    p.add_argument("--stn_reg", type=float, default=0.0,
+                   help="weight cho STN regularization thêm vào box_loss")
+    p.add_argument("--stn_grad_mult", type=float, default=0.2,
+                   help="scale riêng gradient cho STN (0.2 => update nhẹ)")
 
     # Pairing
     p.add_argument("--pairing", action="store_true")
@@ -72,7 +84,7 @@ def parse_args() -> argparse.Namespace:
                    default=r"C:\OneDrive\Study\AI\STN_Final_Term\pairing\bgpair_map.json")
 
     # SupCon (tham số được “inject” vào loss + lịch bật/tắt)
-    p.add_argument("--supcon_start_epoch", type=int, default=3)  # dùng History/SupConScheduler kiểu "3-"
+    p.add_argument("--supcon_start_epoch", type=int, default=3)  # dùng SupConScheduler kiểu "3-"
     p.add_argument("--supcon_feat", type=str, default="stn")
     p.add_argument("--supcon_warp_gt", type=int, default=0)
     p.add_argument("--supcon_out", type=int, default=7)
@@ -94,6 +106,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--supcon_proj_dim", type=int, default=0)
     p.add_argument("--supcon_proj_hidden", type=int, default=512)
     p.add_argument("--supcon_proj_bn", type=int, default=1)
+    p.add_argument("--supcon_proj_lr", type=float, default=1e-3,
+                   help="learning rate riêng cho SupCon projector param group")
 
     # Debug
     p.add_argument("--debug_images_every", type=int, default=5)
@@ -138,7 +152,6 @@ def parse_args() -> argparse.Namespace:
     Path(args.output).mkdir(parents=True, exist_ok=True)
     return args
 
-
 # ---------------- Gắn callback & train ----------------
 def train_one(args: argparse.Namespace, run_idx: int) -> None:
     run_name = args.name or f"{Path(args.model).stem}_run{run_idx:03d}"
@@ -149,6 +162,15 @@ def train_one(args: argparse.Namespace, run_idx: int) -> None:
     supcon_schedule_str = f"{max(1, int(args.supcon_start_epoch))}-"
 
     # 2) attach toàn bộ callback — KHÔNG gắn CleanupSTNWrappers để tránh set None vào ModuleList
+    supcon_proj_cfg = None
+    if int(args.supcon_proj_dim) > 0:
+        supcon_proj_cfg = dict(
+            in_dim=1,
+            out_dim=int(args.supcon_proj_dim),
+            hidden=int(args.supcon_proj_hidden),
+            bn=int(args.supcon_proj_bn),
+            lr=float(args.supcon_proj_lr),
+        )
     attach_callbacks(
         yolo,
         stn_cfg=dict(
@@ -184,6 +206,8 @@ def train_one(args: argparse.Namespace, run_idx: int) -> None:
             supcon_proj_dim=int(args.supcon_proj_dim),
             supcon_proj_hidden=int(args.supcon_proj_hidden),
             supcon_proj_bn=int(args.supcon_proj_bn),
+            stn_reg=float(args.stn_reg),
+
         ),
         supcon_schedule=supcon_schedule_str,         # ví dụ: "3-"
         supcon_reinforce_keys=[
@@ -194,7 +218,7 @@ def train_one(args: argparse.Namespace, run_idx: int) -> None:
             "supcon_proj_bn", "supcon_on",
         ],
         supcon_tap=dict(out_idx=int(args.supcon_out)),
-        supcon_proj_attach=None,                     # truyền dict nếu bạn có projector sẵn
+        supcon_proj_attach=supcon_proj_cfg,
         supcon_percent_logger=bool(int(args.supcon_log)),
 
         link_trainer_to_loss=True,
@@ -202,17 +226,27 @@ def train_one(args: argparse.Namespace, run_idx: int) -> None:
         nan_guard=dict(stop_on_nan=True, save_bad_batch=True),
         batch_sanity=dict(eps=1e-6),
 
-        enable_val_loss=True,
-        val_force_args=dict(conf=0.25, iou=0.50, max_det=300, agnostic=False),
-        val_debug_overrides=None,  # ví dụ: {"conf":0.01,"iou":0.5,"every_n":5}
-        val_trap=True,
+        enable_val_loss=False,
+        val_force_args=None,
+        val_debug_overrides=None,
+        val_trap=False,
 
         debug_images=dict(epochs={0, 1, 2, 5, 10}, max_images=5),
         debug_bgpair=dict(epochs={0, 1, 2, 5, 10}, max_pairs=4),
 
         results_csv_guard=True,
-        final_eval_fix=True,                          # vẫn bật guard (dù đã patch final_eval ở trên)
-        save_last_best_only=False,
+        final_eval_fix=True,
+        save_last_best_only=True,
+    )
+    # --- Bật gói ValTrap + Safety: predict path + NMS + log chi tiết ---
+    register_val_trap_and_safety(
+        yolo,
+        conf=0.01,     # hoặc 0.10 tuỳ bạn muốn mAP nghiêm hay thoáng
+        iou=0.10,      # cho CXR bạn đang dùng 0.10 nên giữ nguyên để so sánh
+        max_det=300,
+        half_if_cuda=True,
+        nms=True,
+        post_loss_k=0,  # 0 = không cần tính val-loss post, tập trung mAP trước
     )
 
     # Pairing
@@ -241,17 +275,17 @@ def train_one(args: argparse.Namespace, run_idx: int) -> None:
         # để validator có biểu đồ (PR/F1/confusion)
         plots=True,
 
-        # detect “dịu” cho CXR
-        conf=0.01, iou=0.10, max_det=300, half=True, workers=8,
-        flipud=0.5, fliplr=0.5, mosaic=0.75, mixup=0.0, cutmix=0.0, copy_paste=0.0, auto_augment="none",
-
         # RẤT QUAN TRỌNG: tránh simplify trong pipeline cuối để không mất module custom
         simplify=False,
     )
 
-
 def main():
     args = parse_args()
+
+    # Cấy một số tham số “nghiên cứu” vào ENV để Trainer đọc được
+    import os
+    os.environ["STN_GRAD_MULT"] = str(args.stn_grad_mult)
+
     for i in range(1, int(args.runs) + 1):
         LOGGER.info(f"===== RUN {i}/{args.runs} =====")
         train_one(args, i)

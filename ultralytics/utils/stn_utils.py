@@ -2081,6 +2081,29 @@ class ValTrap:
             except Exception:
                 payload[attr] = type(getattr(v, attr, None)).__name__
 
+        # Thử parse stats kiểu YOLO: list[(correct, conf, pcls, tcls), ...]
+        try:
+            stats = getattr(v, "stats", None)
+            if isinstance(stats, list) and stats:
+                n_batches = len(stats)
+                n_pred = 0
+                n_correct = 0
+                for s in stats:
+                    if not isinstance(s, (list, tuple)) or len(s) < 4:
+                        continue
+                    correct, conf, pcls, tcls = s
+                    # số prediction trong batch
+                    if hasattr(pcls, "shape"):
+                        n_pred += int(pcls.shape[0])
+                    # số match đúng (IoU + class)
+                    if hasattr(correct, "sum"):
+                        n_correct += int(correct.sum().item() if hasattr(correct, "item") is False else int(correct.sum()))
+                payload["stats_n_batches"] = n_batches
+                payload["stats_n_pred"] = n_pred
+                payload["stats_n_correct"] = n_correct
+        except Exception as e:
+            payload["stats_parse_err"] = str(e)
+
         # thời lượng validate
         try:
             import time

@@ -174,6 +174,7 @@ _SUPCON_KEYS = (
     "supcon_neg_cap", "supcon_schedule", "supcon_proj_dim", "supcon_proj_hidden", "supcon_proj_bn",
     "supcon_neg_per_pos", "supcon_min_neg_w", "supcon_log_n",
     "supcon_neg_iou_ignore", "supcon_neg_sameimg_only",
+    "stn_reg", "supcon_proj_lr","stn_grad_mult"
 )
 
 def _norm_pyramids_for_loss(preds, expect_n: int):
@@ -967,8 +968,6 @@ class v8DetectionLoss:
         loss_t = (t).pow(2).sum()
         return loss_m + 0.25 * loss_t
 # ----------------------------------------------------------------------(ntnhan.0705)
-
-
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
