@@ -129,17 +129,18 @@ class RotatedBboxLoss(BboxLoss):
         return loss_iou, loss_dfl
 
 # ----------------------------------------------------------------------(ntnhan.0705)
-# ======================= (Helpers — logging one-shot) =======================
-_ONCE_FLAGS = set()
+# ======================= (Helpers — logging) =======================
+# BỎ cơ chế 'log một lần' để dễ debug:
+# - Mọi lần gọi _warn_once / _info_once đều in log đầy đủ.
+# - Giữ lại tên hàm để không phải sửa các chỗ gọi bên dưới.
+
 def _warn_once(key: str, msg: str):
-    if key not in _ONCE_FLAGS:
-        _ONCE_FLAGS.add(key)
-        LOGGER.warning(msg)
+    """Wrapper quanh LOGGER.warning, không còn giới hạn 1 lần."""
+    LOGGER.warning(msg)
 
 def _info_once(key: str, msg: str):
-    if key not in _ONCE_FLAGS:
-        _ONCE_FLAGS.add(key)
-        LOGGER.info(msg)
+    """Wrapper quanh LOGGER.info, không còn giới hạn 1 lần."""
+    LOGGER.info(msg)
 
 def _safe_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     if x is None:

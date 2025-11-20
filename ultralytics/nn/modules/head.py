@@ -190,24 +190,31 @@ class Detect(nn.Module):
 
 # -------------------------------------------------------------------- (ntnhan.0705)
 def _invert_affine(theta: Tensor) -> Tensor:
-    """Đảo batch affine 2×3 (B,2,3) ⇒ (B,2,3)."""
+    """
+    Đảo batch affine 2×3: (B, 2, 3) -> (B, 2, 3).
+
+    Ý tưởng:
+    - Ghép thêm hàng [0, 0, 1] để được ma trận 3x3.
+    - Dùng torch.inverse cho từng ma trận 3x3.
+    - Cắt lại 2 hàng đầu để dùng cho affine_grid.
+    """
     B = theta.size(0)
-    # ghép hàng [0 0 1] ➜ 3×3, rồi inverse
+    # tạo hàng [0 0 1] (B, 1, 3)
     bottom = theta.new_tensor([0.0, 0.0, 1.0]).view(1, 1, 3).expand(B, 1, 3)
-    full   = torch.cat([theta, bottom], dim=1)              # (B,3,3)
-    inv    = torch.inverse(full)[:, :2]                     # (B,2,3)
+    full = torch.cat([theta, bottom], dim=1)      # (B, 3, 3)
+    inv = torch.inverse(full)[:, :2]              # (B, 2, 3)
     return inv
 
 class DetectSDTN(Detect):
     """
     Detect head + Spatial **De**-Transformer.
-    Khi STN bật, head tự “gỡ xoắn” feature-map bằng θ-¹ nên bbox trả
+    Khi STN bật, head tự “gỡ xoắn” feature-map bằng θ⁻¹ nên bbox trả
     về vẫn nằm trên hệ toạ độ ảnh gốc.
     """
 
     def __init__(self, nc=80, ch=()):
         super().__init__(nc, ch)
-        self._stn: SpatialTransformer | None = None   # tìm lười biếng
+        self._stn: SpatialTransformer | None = None   # sẽ tìm lười biếng
         self.active = True                            # callback ngoài có thể tắt
 
     # ---------------- private helpers -----------------
@@ -215,37 +222,55 @@ class DetectSDTN(Detect):
         """
         Tìm STN đang được register. Nếu không có, tạo placeholder với theta=None
         (sẽ tạo identity theo batch ngay trong forward).
+
+        [PATCH-1]
+        - Dùng luôn SpatialTransformer đã import ở đầu file.
+        - Nếu registry rỗng thì fallback sang identity + log cảnh báo 1 lần.
         """
         if getattr(self, "_stn", None) is not None:
+            # đã tìm rồi, không làm lại
             return
+
         from types import SimpleNamespace
+
+        stn_cls = None
         try:
-            from ultralytics.nn.modules.block import SpatialTransformer
+            # Dùng class đã import sẵn ở đầu file
+            stn_cls = SpatialTransformer
         except Exception:
-            SpatialTransformer = None
+            stn_cls = None
 
-        if SpatialTransformer and getattr(SpatialTransformer, "registry", None):
-            # Ưu tiên STN thật từ registry
-            self._stn = SpatialTransformer.registry[0]
-        else:
-            # Fallback an toàn: không đặt theta (1,2,3) cứng nữa
-            try:
-                import torch
-                dev = next((p.device for p in self.parameters()), None) or "cpu"
-            except Exception:
-                dev = "cpu"
-            self._stn = SimpleNamespace(theta=None, device=dev)
+        if stn_cls is not None and getattr(stn_cls, "registry", None):
+            reg = stn_cls.registry
+            # registry là list các instance STN; lấy phần tử cuối cùng cho chắc
+            if isinstance(reg, (list, tuple)) and len(reg):
+                self._stn = reg[-1]
+                # Có thể log nhẹ 1 lần nếu cần debug
+                try:
+                    LOGGER.info(f"[DetectSDTN] Attach STN from registry (len={len(reg)})")
+                except Exception:
+                    pass
+                return
 
-    # bên trên file đã có:
-    # from torch import Tensor
-    # import torch.nn.functional as F
+        # Nếu tới đây vẫn chưa tìm được STN thật -> dùng identity
+        try:
+            dev = next((p.device for p in self.parameters()), None) or "cpu"
+        except Exception:
+            dev = "cpu"
 
+        self._stn = SimpleNamespace(theta=None, device=dev)
+        try:
+            LOGGER.warning("[DetectSDTN] No SpatialTransformer found in registry, using identity theta.")
+        except Exception:
+            pass
     def _dewarp_feats(
             self,
             feats: list[Tensor] | tuple[Tensor, ...],
             theta_inv: Tensor
     ) -> list[Tensor]:
-        """Affine-grid + grid-sample cho từng feature-map, tự ép device/dtype theo feature.
+        """
+        Affine-grid + grid-sample cho từng feature-map, tự ép device/dtype theo feature.
+
         - Đảm bảo theta_inv có batch khớp với từng feature (B,2,3).
         - Ép theta_inv về đúng device/dtype của feature để tránh lỗi cuda:0 vs cpu.
         """
@@ -261,8 +286,10 @@ class DetectSDTN(Detect):
             # Khớp batch cho theta_inv
             Ti = theta_inv
             if Ti.size(0) == 1 and B > 1:
+                # 1 -> B (cùng 1 theta cho cả batch)
                 Ti = Ti.expand(B, -1, -1).contiguous()
             elif Ti.size(0) != B:
+                # Nếu batch theta lớn hơn, cắt bớt để khớp
                 Ti = Ti[:B, :, :].contiguous()
 
             # Ép device/dtype theo feature
@@ -278,9 +305,16 @@ class DetectSDTN(Detect):
     def forward(self, x):
         """
         x: list/tuple các feature maps [P3, P4, P5].
-        Nếu self.active=True thì de-warp bằng theta_inv theo batch B.
+
+        Nếu self.active=True thì de-warp bằng theta_inv theo batch B trước khi
+        gọi Detect.forward, đảm bảo bbox vẫn ở hệ toạ độ ảnh gốc.
+
+        [PATCH-2]
+        - Chuẩn hoá theta (shape, device, dtype) an toàn hơn.
+        - Chỉ log info 1 lần để tránh spam.
         """
         if self.active and isinstance(x, (list, tuple)) and len(x):
+            # Tìm STN 1 lần, gắn vào self._stn (có thể là identity)
             self._lazy_find_stn()
 
             B = x[0].shape[0]
@@ -288,25 +322,33 @@ class DetectSDTN(Detect):
             dtype = x[0].dtype
 
             theta = getattr(self._stn, "theta", None)
-            import torch
 
             if theta is None:
                 # Identity theo batch + đúng dtype/device
-                theta = torch.tensor([[1, 0, 0], [0, 1, 0]], dtype=dtype, device=dev).unsqueeze(0).expand(B, -1, -1)
+                theta = torch.tensor(
+                    [[1, 0, 0],
+                     [0, 1, 0]],
+                    dtype=dtype,
+                    device=dev,
+                ).unsqueeze(0).expand(B, -1, -1)
             else:
+                # Chuẩn hoá shape: (2,3) -> (1,2,3)
                 if theta.dim() == 2:
-                    theta = theta.unsqueeze(0)  # (2,3)->(1,2,3)
+                    theta = theta.unsqueeze(0)
+
                 # Ép device + dtype rồi chuẩn hoá batch
                 theta = theta.to(device=dev, dtype=dtype, non_blocking=True)
+
                 if theta.size(0) == 1 and B > 1:
+                    # 1 theta áp dụng cho cả batch
                     theta = theta.expand(B, -1, -1).contiguous()
                 elif theta.size(0) != B:
+                    # Theta nhiều hơn batch -> cắt bớt, phòng mismatch do logging/other
                     theta = theta[:B, :, :].contiguous()
 
             # Log sanity 1 lần (ở pha build warm-up B=1 là bình thường)
             if not hasattr(self, "_theta_once"):
                 try:
-                    from ultralytics.utils import LOGGER
                     LOGGER.info(f"[DetectSDTN] B={B}, theta_shape={tuple(theta.shape)}")
                 except Exception:
                     pass
@@ -318,7 +360,7 @@ class DetectSDTN(Detect):
             # GỌI HÀM INSTANCE (đảm bảo _dewarp_feats KHÔNG có @staticmethod)
             x = self._dewarp_feats(x, theta_inv)
 
-        # Gọi logic Detect gốc
+        # Gọi logic Detect gốc (đã nhận feature-map sau de-warp nếu active=True)
         return super().forward(x)
 
 # -------------------------------------------------------------------- (ntnhan.0705)

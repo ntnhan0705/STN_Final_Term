@@ -738,21 +738,19 @@ class BaseTrainer:
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
-                # Forward pass (with autocast if AMP is enabled)
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
                     loss, self.loss_items = self.model(batch)
-                    # Guard nhẹ: nếu loss không phải Tensor có grad thì bỏ qua batch này
-                    if not (torch.is_tensor(loss) and loss.requires_grad):
-                        LOGGER.warning("[WARN] Model returned a non-differentiable loss. Skipping this batch.")
-                        continue
 
-                    # (Optional) soft guard – just warn, don't raise
+                    # Guard: nếu loss không phải Tensor có grad thì bỏ qua batch này
                     if not (torch.is_tensor(loss) and loss.requires_grad):
                         LOGGER.warning(
-                            "[WARN] Loss appears non-differentiable (no grad_fn). "
-                            "If this repeats, check that the internal v8DetectionLoss instance is used by the model."
+                            "[WARN] Model returned a non-differentiable loss (no grad_fn). "
+                            "Skipping this batch. Kiểm tra lại xem model.forward(train) "
+                            "có đang dùng đúng v8DetectionLoss bên trong hay không."
                         )
+                        continue
+
 
                 # Normalize loss_items to a 1D tensor
                 if not isinstance(self.loss_items, torch.Tensor):
@@ -1033,12 +1031,19 @@ class BaseTrainer:
             weights, _ = attempt_load_one_weight(self.args.pretrained)
         # Instantiate model (calls underlying Model class with cfg and weights)
         self.model = self.get_model(cfg=cfg, weights=weights, verbose=(RANK == -1))
-        # Attach loss
-        self.loss = v8DetectionLoss(self.model, self.args)
 
-        # >>> THÊM: để các callback SupCon tìm thấy criterion ở trong model
+        # ===== Attach detection loss (khớp loss.py mới) =====
+        # - loss.py hiện tại: v8DetectionLoss(model, tal_topk=10)
+        # - tuỳ chọn: lấy tal_topk từ self.args nếu bạn có cấu hình, mặc định 10
+        tal_topk = int(getattr(self.args, "tal_topk", 10))
+        self.loss = v8DetectionLoss(self.model, tal_topk=tal_topk)
+
+        # Cho các callback SupCon / code khác tìm thấy criterion trong model
         self.model.criterion = self.loss
         self.model.loss = self.loss
+
+        return ckpt
+
 
         return ckpt
 
@@ -1089,10 +1094,22 @@ class BaseTrainer:
             fitness (float): Fitness score (higher is better).
         """
         metrics = self.validator(self)
-        fitness = metrics.pop("fitness", -float(self.loss.detach().cpu().numpy()))  # default fitness is negative loss if not provided
+
+        # fallback an toàn nếu validator không có 'fitness'
+        default_fitness = 0.0
+        try:
+            if torch.is_tensor(self.loss):
+                default_fitness = -float(self.loss.detach().cpu().numpy())
+        except Exception:
+            default_fitness = 0.0
+
+        fitness = metrics.pop("fitness", default_fitness)
+
         if self.best_fitness is None or fitness > self.best_fitness:
             self.best_fitness = fitness
+
         return metrics, fitness
+
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Must be implemented by subclasses to return a model instance."""

@@ -1787,12 +1787,16 @@ def normalize_bgpair_map(map_path: str):
     by_base = {k: sorted(list(v)) for k, v in by_base.items()}
     return normed, by_base
 
+
 def _build_abn_mask_from_labels(batch):
-    B = int(batch['img'].shape[0]); abn = [0] * B
+    B = int(batch['img'].shape[0])
+    abn = [0] * B
     if 'batch_idx' in batch and 'cls' in batch and len(batch['batch_idx']) > 0:
         for b in batch['batch_idx'].tolist():
-            if 0 <= b < B: abn[b] = 1
+            if 0 <= b < B:
+                abn[b] = 1
     return abn
+
 
 def _make_pairs_in_batch(im_files, bgmap_abs, bgmap_base):
     im_files_norm = [os.path.normpath(p).lower() for p in im_files]
@@ -1803,29 +1807,52 @@ def _make_pairs_in_batch(im_files, bgmap_abs, bgmap_base):
     # exact path
     for i, p in enumerate(im_files_norm):
         cand = bgmap_abs.get(p, [])
-        j = next((by_name[os.path.basename(c)] for c in cand if os.path.normpath(c).lower() in in_batch), -1)
+        j = next(
+            (by_name[os.path.basename(c)] for c in cand
+             if os.path.normpath(c).lower() in in_batch),
+            -1,
+        )
         pair_idx[i] = j
+
     # fallback basename
     for i, p in enumerate(im_files_norm):
-        if pair_idx[i] != -1: continue
+        if pair_idx[i] != -1:
+            continue
         base = os.path.basename(p)
         cand_base = bgmap_base.get(base, [])
         j = next((by_name[b] for b in cand_base if b in by_name), -1)
         pair_idx[i] = j
+
     return pair_idx
 
-def _wrap_collate_with_pairs(default_collate_fn, bgmap_abs, bgmap_base):
-    def collate(batch):
-        b = default_collate_fn(batch)
-        im_files = b.get('im_files', None)
+
+class PairingCollate:
+    """
+    Callable top-level (pickle được) để bọc collate_fn gốc và bơm:
+      - im_files (chuẩn hóa path)
+      - pair_idx
+      - abn_mask
+    """
+    def __init__(self, default_collate_fn, bgmap_abs, bgmap_base):
+        self.default_collate_fn = default_collate_fn
+        self.bgmap_abs = bgmap_abs
+        self.bgmap_base = bgmap_base
+        # flag để register_pairing biết là đã wrap rồi
+        self._pair_collate_wrapped = True
+
+    def __call__(self, batch):
+        b = self.default_collate_fn(batch)
+        im_files = b.get("im_files", None)
         if im_files is None:
             return b
-        b['im_files'] = [os.path.normpath(p) for p in im_files]
-        b['pair_idx'] = _make_pairs_in_batch(b['im_files'], bgmap_abs, bgmap_base)
-        b['abn_mask'] = _build_abn_mask_from_labels(b)
+
+        b["im_files"] = [os.path.normpath(p) for p in im_files]
+        b["pair_idx"] = _make_pairs_in_batch(
+            b["im_files"], self.bgmap_abs, self.bgmap_base
+        )
+        b["abn_mask"] = _build_abn_mask_from_labels(b)
         return b
-    setattr(collate, "_pair_collate_wrapped", True)
-    return collate
+
 
 def register_pairing(yolo, *, bgpair_map: str, batch_size: int | None = None):
     """
@@ -1844,11 +1871,16 @@ def register_pairing(yolo, *, bgpair_map: str, batch_size: int | None = None):
     try:
         import inspect
         from ultralytics.utils.stn_pairing import UsePairedLoader
+
         sig = inspect.signature(UsePairedLoader)
         kwargs = {}
-        if "bgpair_map" in sig.parameters: kwargs["bgpair_map"] = bgpair_map
-        if "batch" in sig.parameters and batch_size is not None: kwargs["batch"] = int(batch_size)
-        elif "batch_size" in sig.parameters and batch_size is not None: kwargs["batch_size"] = int(batch_size)
+        if "bgpair_map" in sig.parameters:
+            kwargs["bgpair_map"] = bgpair_map
+        if "batch" in sig.parameters and batch_size is not None:
+            kwargs["batch"] = int(batch_size)
+        elif "batch_size" in sig.parameters and batch_size is not None:
+            kwargs["batch_size"] = int(batch_size)
+
         pl = UsePairedLoader(**kwargs)
         for hook_name in ("on_fit_epoch_start", "on_train_start", "on_pretrain_routine_end"):
             if hasattr(pl, hook_name):
@@ -1863,14 +1895,18 @@ def register_pairing(yolo, *, bgpair_map: str, batch_size: int | None = None):
         if dl is None or not hasattr(dl, "collate_fn") or dl.collate_fn is None:
             LOGGER.warning("[Pairing] train_loader.collate_fn not available; skip collate wrap")
             return
+
+        # tránh wrap nhiều lần
         if getattr(dl.collate_fn, "_pair_collate_wrapped", False):
             return
-        dl.collate_fn = _wrap_collate_with_pairs(dl.collate_fn, bg_abs, bg_base)
+
+        dl.collate_fn = PairingCollate(dl.collate_fn, bg_abs, bg_base)
         LOGGER.info("[Pairing] collate_fn wrapped with pairing metadata")
 
     yolo.add_callback("on_pretrain_routine_end", _patch_loader)
-    yolo.add_callback("on_train_start", _patch_loader)
-    yolo.add_callback("on_fit_epoch_start", _patch_loader)
+    yolo.add_callback("on_train_start",          _patch_loader)
+    yolo.add_callback("on_fit_epoch_start",      _patch_loader)
+
 
 # =============================================================================
 # 12) ValTrap + Val safety: không mất mAP, ép NMS, tính val-loss nhẹ sau cùng

@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--save", type=int, default=1)
     p.add_argument("--save_period", type=int, default=-1)
-    p.add_argument("--amp", type=int, default=0)
+    p.add_argument("--amp", type=int, default=1)
     p.add_argument("--name", type=str, default=None)
 
     # STN schedule (chỉ phần lịch & log)
@@ -84,20 +84,20 @@ def parse_args() -> argparse.Namespace:
                    default=r"C:\OneDrive\Study\AI\STN_Final_Term\pairing\bgpair_map.json")
 
     # SupCon (tham số được “inject” vào loss + lịch bật/tắt)
-    p.add_argument("--supcon_start_epoch", type=int, default=3)  # dùng SupConScheduler kiểu "3-"
+    p.add_argument("--supcon_start_epoch", type=int, default=5)  # dùng SupConScheduler kiểu "3-"
     p.add_argument("--supcon_feat", type=str, default="stn")
     p.add_argument("--supcon_warp_gt", type=int, default=0)
     p.add_argument("--supcon_out", type=int, default=7)
     p.add_argument("--supcon_min_box", type=int, default=1)
     p.add_argument("--supcon_max_per_class", type=int, default=0)
-    p.add_argument("--supcon_gain", type=float, default=0.25)
+    p.add_argument("--supcon_gain", type=float, default=0.5)
     p.add_argument("--supcon_temp", type=float, default=0.5)
     p.add_argument("--supcon_warmup", type=int, default=5)
     p.add_argument("--supcon_log", type=int, default=1)
     p.add_argument("--supcon_use_mem", type=int, default=1)
     p.add_argument("--supcon_queue", type=int, default=4096)
     p.add_argument("--supcon_loss_weight", type=float, default=None)
-    p.add_argument("--supcon_neg_iou_ignore", type=float, default=0.30)
+    p.add_argument("--supcon_neg_iou_ignore", type=float, default=0.20)
     p.add_argument("--supcon_neg_sameimg_only", type=int, default=1)
     p.add_argument("--supcon_neg_cap", type=int, default=2048)
     p.add_argument("--supcon_neg_per_pos", type=float, default=2.0)
