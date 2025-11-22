@@ -256,6 +256,8 @@ class v8DetectionLoss:
         self._log_epoch = -1
         self._mem_log_cnt = 0
         self._roi_log_cnt = 0
+        self._roi_seen = 0
+        self._roi_log_epoch = -1
         self._max_logs = int(getattr(self.hyp, "supcon_log_n", 6))
         self._supcon_stat = {}
         self._supcon_val = None
@@ -660,6 +662,30 @@ class v8DetectionLoss:
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, preds, batch):
+        # try to keep epoch/trainer in sync if available
+        if getattr(self, "_trainer", None) is None:
+            # infer trainer reference from model if it was passed in
+            try:
+                m = getattr(self, "model", None)
+                tr = getattr(m, "trainer", None) if m is not None else None
+                if tr is not None:
+                    self._trainer = tr
+            except Exception:
+                pass
+        if getattr(self, "_trainer", None) is not None:
+            try:
+                self.epoch = int(getattr(self._trainer, "epoch", -1))
+            except Exception:
+                pass
+
+        # final fallback: never keep epoch at -1 (for logging clarity)
+        if getattr(self, "epoch", -1) < 0:
+            try:
+                le = getattr(self, "_log_epoch", -1)
+                self.epoch = max(le + 1, 0)
+            except Exception:
+                self.epoch = 0
+
         # epoch rollover logging
         cur_epoch = getattr(self, "epoch", -1)
         if cur_epoch != getattr(self, "_log_epoch", -2):
@@ -690,6 +716,15 @@ class v8DetectionLoss:
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=torch.float32) * float(self.stride[0])
 
         # ---- build pred views with shape logs
+        # reset per-epoch guard for shape logging; fall back to trainer.epoch if loss.epoch is missing
+        cur_epoch_for_shape = getattr(self, "epoch", getattr(getattr(self, "_trainer", None), "epoch", -1))
+        if cur_epoch_for_shape != self._roi_log_epoch:
+            self._roi_log_cnt = 0
+            self._roi_seen = 0
+            self._roi_log_epoch = cur_epoch_for_shape
+        call_idx = self._roi_seen
+        self._roi_seen += 1
+
         pred_views = []
         shape_notes = []
         for li, xi in enumerate(feats):
@@ -710,9 +745,30 @@ class v8DetectionLoss:
             pred_views.append(xv)
             shape_notes.append((li, tuple(xi.shape), "ok->"+str(tuple(xv.shape))))
 
-        if self._roi_log_cnt < 6:
+        # log only selected batches per epoch when nb is known; else first 3 batches
+        batch_i = getattr(self, "_batch_i", None)
+        nb = getattr(self, "_nb", None)
+        # if trainer is linked and nb missing, try derive from train_loader length
+        if nb is None and getattr(self, "_trainer", None) is not None:
+            try:
+                nb = len(getattr(self._trainer, "train_loader", []))
+                self._nb = nb
+            except Exception:
+                nb = None
+        log_this = False
+        if nb is not None and batch_i is not None:
+            # human-friendly batches 2,3,4 (0-based index 1,2,3), clipped by nb
+            targets = {1, 2, 3}
+            targets = {t for t in targets if t < nb}
+            log_this = int(batch_i) in targets
+        else:
+            # fallback: log on 2nd,3rd,4th calls per epoch
+            log_this = (call_idx + 1) in {2, 3, 4}
+
+        if log_this:
+            disp_epoch = (cur_epoch_for_shape if cur_epoch_for_shape >= 0 else 0) + 1
             LOGGER.info(
-                "[PredCat/shapes] " +
+                f"[PredCat/shapes][epoch={disp_epoch}][batch={batch_i if batch_i is not None else 'NA'}] " +
                 ", ".join([f"L{li}:{s}->{note}" for (li, s, note) in shape_notes])
             )
             self._roi_log_cnt += 1

@@ -1,17 +1,14 @@
 # main_stn.py — attach_callbacks “đầy đủ tham số” + register_pairing (safe, no CleanupSTNWrappers, simplify=False)
 from __future__ import annotations
 import argparse
+import logging
 from pathlib import Path
 
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER
 
 # tất cả đều lấy từ stn_utils.py
-from ultralytics.utils.stn_utils import (
-    attach_callbacks,
-    register_pairing,
-    register_val_trap_and_safety,
-)
+from ultralytics.utils.stn_utils import attach_callbacks, register_pairing, register_val_trap_and_safety
 
 # ===================== Final-eval SAFE PATCH =====================
 # Dùng in-memory model cho final_eval (tránh AutoBackend nạp lại rồi fuse làm rụng module custom)
@@ -36,6 +33,32 @@ if _BaseT is None:
 _BaseT.final_eval = _final_eval_safe
 # ================================================================
 # ---------------- CLI ----------------
+
+def _add_file_handler(logger: logging.Logger, path: Path, level=logging.INFO):
+    """Thêm file handler (tránh nhân đôi)."""
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler) and Path(getattr(h, "baseFilename", "")) == path:
+            return
+    fh = logging.FileHandler(path, mode="a", encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    fh.setLevel(level)
+    logger.addHandler(fh)
+
+
+def setup_logging(run_dir: Path):
+    """Ghi ra stn_train.log + stn_val.log trong thư mục run."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    train_log = run_dir / "stn_train.log"
+    val_log = run_dir / "stn_val.log"
+    _add_file_handler(root_logger, train_log, level=logging.INFO)
+    _add_file_handler(logging.getLogger("ultralytics"), train_log, level=logging.INFO)
+    _add_file_handler(logging.getLogger("ultralytics.val"), val_log, level=logging.INFO)
+    LOGGER.info(f"[LogFiles] train={train_log} val={val_log}")
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="YOLO-STN + SupCon (đầy đủ callback từ stn_utils)")
 
@@ -111,11 +134,12 @@ def parse_args() -> argparse.Namespace:
 
     # Debug
     p.add_argument("--debug_images_every", type=int, default=5)
+    p.add_argument("--debug", type=int, default=0, help="1 => gắn callback debug thuần log")
 
     # Dev fallback
     import sys, torch
     if len(sys.argv) == 1:
-        LOGGER.info("[INFO] No CLI provided  using dev fallback paths")
+        LOGGER.info("[Info] No CLI args provided; using dev fallback paths")
         dev_cli = [
             "--yaml",   r"C:/OneDrive/Study/AI/STN_Final_Term/dataset.yaml",
             "--model",  r"C:/OneDrive/Study/AI/STN_Final_Term/models/yolo11m_stn.pt",
@@ -155,7 +179,10 @@ def parse_args() -> argparse.Namespace:
 # ---------------- Gắn callback & train ----------------
 def train_one(args: argparse.Namespace, run_idx: int) -> None:
     run_name = args.name or f"{Path(args.model).stem}_run{run_idx:03d}"
-    LOGGER.info(f"[Run] name={run_name} -> save at {args.output}")  # log rõ vị trí lưu
+    run_dir = Path(args.output) / run_name
+    LOGGER.info(f"[Run] name={run_name} | save_dir={run_dir}")
+    # Always write logs at the root runs directory (not inside each run folder)
+    setup_logging(Path(args.output))
     yolo = YOLO(args.model)
 
     # 1) Lịch SupCon dạng "start-"
@@ -247,6 +274,7 @@ def train_one(args: argparse.Namespace, run_idx: int) -> None:
         half_if_cuda=True,
         nms=True,
         post_loss_k=0,  # 0 = không cần tính val-loss post, tập trung mAP trước
+        log_file=Path(args.output) / "stn_val.log",
     )
 
     # Pairing
@@ -285,6 +313,11 @@ def main():
     # Cấy một số tham số “nghiên cứu” vào ENV để Trainer đọc được
     import os
     os.environ["STN_GRAD_MULT"] = str(args.stn_grad_mult)
+
+    # When running from PyCharm, pre-attach file handlers so log files are created early
+    if os.environ.get("PYCHARM_HOSTED"):
+        setup_logging(Path(args.output))
+        LOGGER.info(f"[PyCharm] Pre-attached file handlers at {Path(args.output)}")
 
     for i in range(1, int(args.runs) + 1):
         LOGGER.info(f"===== RUN {i}/{args.runs} =====")

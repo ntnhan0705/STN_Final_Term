@@ -532,7 +532,16 @@ class BaseTrainer:
 
             # cho loss đọc trainer handle (chỉ supcon_*)
             try:
-                crit._trainer = SimpleNamespace(args=merged)
+                prev = getattr(crit, "_trainer", None)
+                if isinstance(prev, SimpleNamespace):
+                    prev.args = merged
+                    if not hasattr(prev, "epoch"):
+                        prev.epoch = getattr(trainer, "epoch", 0)
+                    if not hasattr(prev, "trainer"):
+                        prev.trainer = trainer
+                    crit._trainer = prev
+                else:
+                    crit._trainer = SimpleNamespace(args=merged, epoch=getattr(trainer, "epoch", 0), trainer=trainer)
             except Exception:
                 pass
 
@@ -722,6 +731,23 @@ class BaseTrainer:
 
             self.tloss = None  # reset cumulative loss for this epoch
             for i, batch in batch_iter:
+                # expose batch index and nb to loss for logging purposes
+                loss_objs = []
+                if getattr(self, "loss", None) is not None:
+                    loss_objs.append(self.loss)
+                try:
+                    ml = getattr(self.model, "loss", None)
+                    if ml is not None and ml is not self.loss:
+                        loss_objs.append(ml)
+                except Exception:
+                    pass
+                for lo in loss_objs:
+                    try:
+                        lo._batch_i = int(i)
+                        lo._nb = int(nb)
+                    except Exception:
+                        pass
+
                 self.run_callbacks("on_train_batch_start")
                 ni = i + nb * epoch  # number of iterations since start
 
@@ -851,6 +877,22 @@ class BaseTrainer:
                 # Update EMA (on main process only)
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
+                    try:
+                        LOGGER.info(
+                            f"[Train/validate] metrics_keys={list(self.metrics.keys())} "
+                            f"fitness={self.fitness} "
+                            f"val_loss={self.metrics.get('val/loss', 'NA')}"
+                        )
+                        # merge validator summary if available
+                        try:
+                            v = getattr(self, "validator", None)
+                            mdict = getattr(v, "metrics", None)
+                            if hasattr(mdict, "results_dict") and isinstance(self.metrics, dict):
+                                self.metrics.update(mdict.results_dict)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
 
                 # Lưu metrics (loss cột động + val metrics + lr) 1 lần
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
@@ -1038,12 +1080,17 @@ class BaseTrainer:
         tal_topk = int(getattr(self.args, "tal_topk", 10))
         self.loss = v8DetectionLoss(self.model, tal_topk=tal_topk)
 
+        # Link trainer into loss/model so loss can read epoch/trainer for logging
+        try:
+            self.loss._trainer = self
+            self.loss.epoch = int(getattr(self, "start_epoch", 0))
+            self.model.trainer = self
+        except Exception:
+            pass
+
         # Cho các callback SupCon / code khác tìm thấy criterion trong model
         self.model.criterion = self.loss
         self.model.loss = self.loss
-
-        return ckpt
-
 
         return ckpt
 

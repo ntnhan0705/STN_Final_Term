@@ -140,6 +140,21 @@ class BaseValidator:
 
         infer_model = (trainer.ema.ema or trainer.model).float().eval()
         self.model = trainer.model
+        try:
+            LOGGER.info(
+                f"[ValLoop/setup_from_trainer] model={self.model.__class__.__name__} "
+                f"id={id(self.model)} device={next(self.model.parameters()).device}"
+            )
+        except Exception:
+            pass
+        try:
+            from ultralytics.utils import LOGGER
+            LOGGER.info(
+                f"[ValLoop/setup_from_trainer] model={self.model.__class__.__name__} "
+                f"id={id(self.model)} device={next(self.model.parameters()).device}"
+            )
+        except Exception:
+            pass
 
         if not self.dataloader:
             self.dataloader = self.get_dataloader(self.data.get(self.args.split), self.args.batch)
@@ -259,6 +274,13 @@ class BaseValidator:
             model = self._resolve_model(model)
             self.model = model
             self.model.eval()
+            try:
+                LOGGER.info(
+                    f"[ValLoop/setup_standalone] model={self.model.__class__.__name__} "
+                    f"id={id(self.model)} device={next(self.model.parameters()).device}"
+                )
+            except Exception:
+                pass
 
             self.data = self.get_data()
             if self.device.type == "cpu":
@@ -273,6 +295,8 @@ class BaseValidator:
         self._attach_names(model)
 
         self.init_metrics(de_parallel(model))
+        debug_cap = 0  # disable per-batch debug logs to keep tqdm intact
+        LOGGER.info(f"[ValLoop/start] len_dataloader={len(self.dataloader)} device={self.device}")
         self.jdict = []
         self.val_log_interval = getattr(self, "val_log_interval", 1)
 
@@ -321,8 +345,27 @@ class BaseValidator:
             "postprocess": dt[3].dt * 1e3 / len(self.dataloader),
         }
         self.finalize_metrics()
+        try:
+            summary = None
+            if hasattr(self.metrics, "results_dict"):
+                rd_attr = self.metrics.results_dict
+                rd = rd_attr() if callable(rd_attr) else rd_attr
+                if isinstance(rd, dict):
+                    sel = ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)", "fitness", "val/loss"]
+                    summary = {k: rd.get(k) for k in sel if k in rd}
+            LOGGER.info(
+                f"[ValLoop/end] stats_len={len(self.stats) if self.stats is not None else 'None'} "
+                f"metrics={summary if summary is not None else 'NA'} speed={self.speed}"
+            )
+        except Exception:
+            pass
         self.print_results()
         self.run_callbacks("on_val_end")
+        if self.training and trainer is not None:
+            try:
+                trainer.metrics = dict(self.metrics) if isinstance(self.metrics, dict) else self.metrics
+            except Exception:
+                pass
         if self.training:
             try:
                 loss_scalar = float(self.loss.detach().sum().cpu().item())

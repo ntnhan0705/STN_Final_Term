@@ -16,6 +16,11 @@ from torchvision.utils import make_grid
 from ultralytics.utils import LOGGER
 from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.plotting import plot_images
+# Debug-only classes tách riêng
+try:
+    from ultralytics.utils.stn_utils_debug import DebugImages, DebugBgPairROIs
+except Exception:
+    DebugImages = DebugBgPairROIs = None
 
 # =============================================================================
 # 0) Public API
@@ -707,15 +712,44 @@ class ReinforceSupConToLoss:
 
 
 class LinkTrainerToLoss:
-    def on_train_start(self, t):
-        if getattr(t, "loss", None) is not None:
-            t.loss._trainer = t
+    def _link(self, t):
+        """Attach trainer to loss and sync epoch if available."""
+        # Prefer loss/criterion on model, fallback to trainer fields
+        loss_obj = (
+            getattr(getattr(t, "model", None), "loss", None)
+            or getattr(getattr(t, "model", None), "criterion", None)
+            or getattr(t, "loss", None)
+            or getattr(t, "criterion", None)
+        )
+        if loss_obj is None:
+            return
+        try:
+            loss_obj._trainer = t
+            if hasattr(t, "epoch"):
+                loss_obj.epoch = int(t.epoch)
+        except Exception:
+            pass
+
+    def on_train_start(self, t):        self._link(t)
+    def on_train_epoch_start(self, t):  self._link(t)
+    def on_train_batch_start(self, t):  self._link(t)
 
 class SyncEpochToLoss:
-    def on_train_epoch_start(self, t):
-        if getattr(t, "loss", None) is not None: t.loss.epoch = int(t.epoch)
-    def on_train_batch_start(self, t):
-        if getattr(t, "loss", None) is not None: t.loss.epoch = int(t.epoch)
+    def _sync(self, t):
+        loss_obj = (
+            getattr(getattr(t, "model", None), "loss", None)
+            or getattr(getattr(t, "model", None), "criterion", None)
+            or getattr(t, "loss", None)
+            or getattr(t, "criterion", None)
+        )
+        if loss_obj is not None and hasattr(t, "epoch"):
+            try:
+                loss_obj.epoch = int(t.epoch)
+            except Exception:
+                pass
+
+    def on_train_epoch_start(self, t):  self._sync(t)
+    def on_train_batch_start(self, t):  self._sync(t)
 
 class TapSTNFeat:
     def __init__(self, out_idx: int | None = None, out_name: str | None = None):
@@ -938,7 +972,7 @@ def _to_uint8_grid(t: torch.Tensor, nrow: int = 4) -> Optional["torch.Tensor"]:
     except Exception:
         return None
 
-class DebugImages(_Ctx):
+class _DebugImagesLegacy(_Ctx):
     """Render ORIGINAL vs STN (+θ) ở các epoch chỉ định."""
     def __init__(self, epochs=(0, 5, 10, 15, 20), max_images=5, subdir: str = "stn_dbg"):
         self.epochs = set(int(e) for e in epochs)
@@ -1161,7 +1195,7 @@ class DebugImages(_Ctx):
 
         LOGGER.info(f"[DebugImages] saved for epoch {ep}")
 
-class DebugBgPairROIs:
+class _DebugBgPairROIsLegacy:
     def __init__(self, epochs=(0,1,2,5,10), max_pairs=4):
         self.epochs = set(epochs or [])
         self.max_pairs = int(max_pairs or 4)
@@ -1284,6 +1318,12 @@ class DebugBgPairROIs:
         fp = save_dir / f"epoch_{e:03d}.jpg"
         cv2.imwrite(str(fp), out)
         LOGGER.info(f"[DebugBgPairROIs] saved {fp} ({len(rows)} pairs)")
+
+# Fallback: nếu không import được bản debug tách riêng, dùng legacy tại chỗ
+if DebugImages is None:
+    DebugImages = _DebugImagesLegacy
+if DebugBgPairROIs is None:
+    DebugBgPairROIs = _DebugBgPairROIsLegacy
 
 # =============================================================================
 # 8) Validation helpers
@@ -1641,6 +1681,8 @@ def attach_callbacks(
         try:
             lnk = LinkTrainerToLoss()
             yolo.add_callback("on_train_start", lnk.on_train_start)
+            yolo.add_callback("on_train_epoch_start", lnk.on_train_epoch_start)
+            yolo.add_callback("on_train_batch_start", lnk.on_train_batch_start)
         except Exception as e:
             LOGGER.warning(f"[Attach] LinkTrainerToLoss failed: {e}")
 
@@ -1920,8 +1962,10 @@ class ValTrap:
     - on_val_end: log metrics/stats/speed + tail(2) của results.csv + thời lượng validate.
     Kết quả in console và (nếu có save_dir) ghi file: <save_dir>/__val_trap.log
     """
-    def __init__(self):
+    def __init__(self, log_path=None):
         self._wrote_first_batch = False
+        from pathlib import Path as _P
+        self.log_path = (_P(log_path) if log_path is not None else None)
         self._logfile = None
         self._t0 = None
         self._csv_size_before = None
@@ -1929,6 +1973,10 @@ class ValTrap:
     # ---------------- internals ----------------
     def _init_logfile(self, trainer):
         try:
+            if self.log_path is not None:
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                self._logfile = self.log_path
+                return
             sd = getattr(trainer, "save_dir", None)
             if sd:
                 from pathlib import Path
@@ -1936,15 +1984,67 @@ class ValTrap:
         except Exception:
             self._logfile = None
 
-    def _write(self, trainer, tag, payload: dict):
+    def _write(self, obj, tag, payload: dict):
         from ultralytics.utils import LOGGER
         # thêm epoch nếu có
         try:
-            ep = getattr(trainer, "epoch", None)
+            ep = getattr(obj, "epoch", None)
             if ep is not None:
                 payload = {"epoch": ep, **payload}
         except Exception:
             pass
+
+        # patch: if metrics missing on trainer, try validator.metrics
+        if "metrics" in payload and payload.get("metrics", None) is None:
+            try:
+                v = getattr(obj, "validator", None) if not hasattr(obj, "metrics") else obj
+                if v is not None and getattr(v, "metrics", None) is not None:
+                    payload["metrics"] = v.metrics
+            except Exception:
+                pass
+
+        # compact metrics if they are DetMetrics to avoid huge logs
+        # compact metrics/results to avoid huge log spam
+        try:
+            m = payload.get("metrics", None)
+            rd = None
+            if hasattr(m, "results_dict"):
+                rd_attr = m.results_dict
+                rd = rd_attr() if callable(rd_attr) else rd_attr
+            summary = None
+            if isinstance(rd, dict):
+                sel_keys = [
+                    "metrics/precision(B)",
+                    "metrics/recall(B)",
+                    "metrics/mAP50(B)",
+                    "metrics/mAP50-95(B)",
+                    "fitness",
+                    "val/loss",
+                ]
+                summary = {k: rd.get(k) for k in sel_keys if k in rd}
+            payload["metrics"] = summary if summary is not None else None
+            # trim results.csv tail if present
+            if "results.csv.tail2" in payload:
+                tail = payload["results.csv.tail2"]
+                if isinstance(tail, (list, tuple)) and len(tail) > 0:
+                    payload["results.csv.tail2"] = tail[-1]
+            # drop heavy fields if they creep in
+            for k in list(payload.keys()):
+                if any(tok in k for tok in ("curves_results", "confusion_matrix", "ap_class_index", "box")):
+                    payload[k] = None
+        except Exception:
+            pass
+
+        # drop/compact stats to avoid huge tensors
+        if "stats" in payload:
+            try:
+                st = payload.get("stats")
+                if isinstance(st, (list, tuple)):
+                    payload["stats"] = f"len={len(st)}"
+                else:
+                    payload["stats"] = "SKIPPED"
+            except Exception:
+                payload["stats"] = "SKIPPED"
 
         # console
         try:
@@ -2014,10 +2114,11 @@ class ValTrap:
             return None
 
     # ---------------- YOLO callbacks ----------------
-    def on_val_start(self, trainer):
+    def on_val_start(self, obj):
+        """obj may be validator or trainer."""
         self._wrote_first_batch = False
         self._t0 = __import__("time").time()
-        v = getattr(trainer, "validator", None)
+        v = obj if hasattr(obj, "model") and hasattr(obj, "metrics") else getattr(obj, "validator", None)
         payload = {}
 
         if v is not None:
@@ -2071,13 +2172,13 @@ class ValTrap:
         self._csv_size_before = self._csv_filesize(trainer)
         payload["results.csv.size_before"] = self._csv_size_before
 
-        self._write(trainer, "start", payload)
+        self._write(obj, "start", payload)
 
-    def on_val_batch_end(self, trainer):
+    def on_val_batch_end(self, obj):
         # chỉ log batch đầu
         if self._wrote_first_batch:
             return
-        v = getattr(trainer, "validator", None)
+        v = obj if hasattr(obj, "model") and hasattr(obj, "metrics") else getattr(obj, "validator", None)
         payload = {}
 
         # feats: khi validator tính val-loss (legacy path) sẽ có
@@ -2102,43 +2203,27 @@ class ValTrap:
         except Exception as e:
             payload["preds_err"] = str(e)
 
-        self._write(trainer, "first_batch", payload)
+        self._write(obj, "first_batch", payload)
         self._wrote_first_batch = True
 
-    def on_val_end(self, trainer):
-        v = getattr(trainer, "validator", None)
+    def on_val_end(self, obj):
+        v = obj if hasattr(obj, "model") and hasattr(obj, "metrics") else getattr(obj, "validator", None)
         payload = {}
 
-        # metrics / stats / speed nếu có
-        for attr in ["metrics", "stats", "speed"]:
-            try:
-                val = getattr(v, attr, None)
-                payload[attr] = str(val)
-            except Exception:
-                payload[attr] = type(getattr(v, attr, None)).__name__
-
-        # Thử parse stats kiểu YOLO: list[(correct, conf, pcls, tcls), ...]
+        # metrics summary only
         try:
-            stats = getattr(v, "stats", None)
-            if isinstance(stats, list) and stats:
-                n_batches = len(stats)
-                n_pred = 0
-                n_correct = 0
-                for s in stats:
-                    if not isinstance(s, (list, tuple)) or len(s) < 4:
-                        continue
-                    correct, conf, pcls, tcls = s
-                    # số prediction trong batch
-                    if hasattr(pcls, "shape"):
-                        n_pred += int(pcls.shape[0])
-                    # số match đúng (IoU + class)
-                    if hasattr(correct, "sum"):
-                        n_correct += int(correct.sum().item() if hasattr(correct, "item") is False else int(correct.sum()))
-                payload["stats_n_batches"] = n_batches
-                payload["stats_n_pred"] = n_pred
-                payload["stats_n_correct"] = n_correct
-        except Exception as e:
-            payload["stats_parse_err"] = str(e)
+            m = getattr(v, "metrics", None)
+            rd = None
+            if hasattr(m, "results_dict"):
+                rd_attr = m.results_dict
+                rd = rd_attr() if callable(rd_attr) else rd_attr
+            if isinstance(rd, dict):
+                sel = ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)", "fitness", "val/loss"]
+                payload["metrics"] = {k: rd.get(k) for k in sel if k in rd}
+            else:
+                payload["metrics"] = None
+        except Exception:
+            payload["metrics"] = None
 
         # thời lượng validate
         try:
@@ -2148,25 +2233,7 @@ class ValTrap:
         except Exception:
             pass
 
-        # đọc tail(2) của results.csv + kích thước sau
-        try:
-            from pathlib import Path
-            import csv
-            p = Path(trainer.save_dir) / "results.csv"
-            if p.exists():
-                rows = []
-                with open(p, "r", newline="", encoding="utf-8") as f:
-                    reader = csv.reader(f)
-                    rows = list(reader)
-                tail2 = rows[-2:] if len(rows) >= 2 else rows
-                payload["results.csv.tail2"] = tail2
-            else:
-                payload["results.csv.tail2"] = "missing"
-            payload["results.csv.size_after"] = self._csv_filesize(trainer)
-        except Exception as e:
-            payload["results.csv_err"] = str(e)
-
-        self._write(trainer, "end", payload)
+        self._write(obj, "end", payload)
 
 
 # -----------------------------------------------------------------------------
@@ -2327,7 +2394,8 @@ def register_val_trap_and_safety(
     max_det=300,
     half_if_cuda=True,
     nms=True,
-    post_loss_k=2
+    post_loss_k=2,
+    log_file=None,
 ):
     """
     Dùng khi bạn có object 'yolo' (YOLO(...)). Hàm này sẽ:
@@ -2337,10 +2405,36 @@ def register_val_trap_and_safety(
       - (Tuỳ chọn) Tính val-loss nhẹ sau khi mAP xong (ValLossPostLite).
     """
     # ValTrap
-    vt = ValTrap()
+    vt = ValTrap(log_path=log_file)
+
+    # attach ValTrap to YOLO callback system (some trainers forward these)
     yolo.add_callback("on_val_start", vt.on_val_start)
     yolo.add_callback("on_val_batch_end", vt.on_val_batch_end)
     yolo.add_callback("on_val_end", vt.on_val_end)
+
+    # ensure validator (once constructed) also has ValTrap callbacks
+    def _attach_vt_to_validator(trainer):
+        try:
+            v = getattr(trainer, "validator", None)
+            if v is None:
+                return
+            for name, fn in (
+                ("on_val_start", vt.on_val_start),
+                ("on_val_batch_end", vt.on_val_batch_end),
+                ("on_val_end", vt.on_val_end),
+            ):
+                try:
+                    cblist = v.callbacks.get(name, [])
+                    if fn not in cblist:
+                        cblist.append(fn)
+                        v.callbacks[name] = cblist
+                except Exception:
+                    pass
+        except Exception:
+            return
+
+    yolo.add_callback("on_train_start", _attach_vt_to_validator)
+    yolo.add_callback("on_pretrain_routine_end", _attach_vt_to_validator)
 
     # Force NMS + args
     fna = ForceValArgsNMS(conf=conf, iou=iou, max_det=max_det, half_if_cuda=half_if_cuda, nms=nms)
@@ -2356,7 +2450,7 @@ def register_val_trap_and_safety(
         yolo.add_callback("on_val_end", vlp.on_val_end)
 
     from ultralytics.utils import LOGGER
-    LOGGER.info("[Attach] ValTrap+Safety registered (nms=%s, post_loss_k=%s)", nms, post_loss_k)
+    LOGGER.info("[Attach] ValTrap+Safety registered (nms=%s, post_loss_k=%s, log_file=%s)", nms, post_loss_k, log_file)
 
 # =============================================================================
 # 13) Minimal attach macro (gọn, có tham số)
