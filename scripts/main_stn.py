@@ -47,7 +47,6 @@ def _add_file_handler(logger: logging.Logger, path: Path, level=logging.INFO):
     fh.setLevel(level)
     logger.addHandler(fh)
 
-
 def setup_logging(run_dir: Path):
     """Ghi ra stn_train.log + stn_val.log trong thư mục run."""
     root_logger = logging.getLogger()
@@ -74,9 +73,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--device", default="auto")
     p.add_argument("--patience", type=int, default=50)
+    p.add_argument("--lr0", type=float, default=1e-4, help="base learning rate")
+    p.add_argument("--lrf", type=float, default=0.01, help="final lr fraction")
     p.add_argument("--save", type=int, default=1)
-    p.add_argument("--save_period", type=int, default=-1)
+    p.add_argument("--save_period", type=int, default=1)
     p.add_argument("--amp", type=int, default=1)
+    p.add_argument("--minimal", type=int, default=1, help="0 => gan STN/SupCon/Pairing/ValTrap, 1 => bo het callback, chay YOLO mac dinh (giu tqdm)")
     p.add_argument("--name", type=str, default=None)
 
     # STN schedule (chỉ phần lịch & log)
@@ -102,12 +104,13 @@ def parse_args() -> argparse.Namespace:
                    help="scale riêng gradient cho STN (0.2 => update nhẹ)")
 
     # Pairing
-    p.add_argument("--pairing", action="store_true")
+    p.add_argument("--pairing", action="store_true", help="bat pairing/SupCon; mac dinh tat")
     p.add_argument("--bgpair_map", type=str,
                    default=r"C:\OneDrive\Study\AI\STN_Final_Term\pairing\bgpair_map.json")
 
     # SupCon (tham số được “inject” vào loss + lịch bật/tắt)
-    p.add_argument("--supcon_start_epoch", type=int, default=5)  # dùng SupConScheduler kiểu "3-"
+    # dat mac dinh rat lon de SupCon tat; neu muon bat thi truyen gia tri nho hon so epoch train
+    p.add_argument("--supcon_start_epoch", type=int, default=999)  # SupConScheduler kieu "start-"
     p.add_argument("--supcon_feat", type=str, default="stn")
     p.add_argument("--supcon_warp_gt", type=int, default=0)
     p.add_argument("--supcon_out", type=int, default=7)
@@ -139,12 +142,15 @@ def parse_args() -> argparse.Namespace:
     # Dev fallback
     import sys, torch
     if len(sys.argv) == 1:
-        LOGGER.info("[Info] No CLI args provided; using dev fallback paths")
+        LOGGER.info("[Info] No CLI args provided; using dev fallback paths (minimal=1, pairing off, LR lowered)")
         dev_cli = [
             "--yaml",   r"C:/OneDrive/Study/AI/STN_Final_Term/dataset.yaml",
             "--model",  r"C:/OneDrive/Study/AI/STN_Final_Term/models/yolo11m_stn.pt",
             "--output", r"C:/OneDrive/Study/AI/STN_Final_Term/runs",
-            "--pairing",
+            "--lr0",    "1e-4",
+            "--lrf",    "0.01",
+            "--minimal", "1",
+            # no --pairing here; SupCon default 999 keeps it off
         ]
         args = p.parse_args(dev_cli)
     else:
@@ -198,88 +204,96 @@ def train_one(args: argparse.Namespace, run_idx: int) -> None:
             bn=int(args.supcon_proj_bn),
             lr=float(args.supcon_proj_lr),
         )
-    attach_callbacks(
-        yolo,
-        stn_cfg=dict(
-            freeze_epochs=int(args.freeze_epochs),
-            stn_warmup=int(args.stn_warmup),
-            tmax=float(args.stn_tmax),
-            smin=float(args.stn_smin),
-            smax=float(args.stn_smax),
-            val_identity=int(args.stn_val_identity),
-            log=int(args.stn_log),
-        ),
-        publish_theta=True,
+    if args.minimal:
+        LOGGER.info("[Mode] Minimal on: skip all STN/SupCon/Pairing/ValTrap/Debug callbacks (YOLO default tqdm); force NMS for val")
+        # Ep validator dung NMS + conf/iou an toan
+        yolo.overrides["nms"] = True
+        yolo.overrides["conf"] = 0.001
+        yolo.overrides["iou"] = 0.5
+        yolo.overrides["max_det"] = 300
+    else:
+        attach_callbacks(
+            yolo,
+            stn_cfg=dict(
+                freeze_epochs=int(args.freeze_epochs),
+                stn_warmup=int(args.stn_warmup),
+                tmax=float(args.stn_tmax),
+                smin=float(args.stn_smin),
+                smax=float(args.stn_smax),
+                val_identity=int(args.stn_val_identity),
+                log=int(args.stn_log),
+            ),
+            publish_theta=True,
 
-        supcon_inject=dict(
-            supcon_feat=str(args.supcon_feat),
-            supcon_warp_gt=int(args.supcon_warp_gt),
-            supcon_out=int(args.supcon_out),
-            supcon_min_box=int(args.supcon_min_box),
-            supcon_max_per_class=int(args.supcon_max_per_class),
-            supcon_gain=float(args.supcon_gain),
-            supcon_temp=float(args.supcon_temp),
-            supcon_warmup=int(args.supcon_warmup),
-            supcon_log=int(args.supcon_log),
-            supcon_use_mem=int(args.supcon_use_mem),
-            supcon_queue=int(args.supcon_queue),
-            supcon_loss_weight=(None if args.supcon_loss_weight is None else float(args.supcon_loss_weight)),
-            supcon_neg_iou_ignore=float(args.supcon_neg_iou_ignore),
-            supcon_neg_sameimg_only=int(args.supcon_neg_sameimg_only),
-            supcon_neg_cap=int(args.supcon_neg_cap),
-            supcon_neg_per_pos=float(args.supcon_neg_per_pos),
-            supcon_min_neg_w=float(args.supcon_min_neg_w),
-            supcon_log_n=int(args.supcon_log_n),
-            supcon_proj_dim=int(args.supcon_proj_dim),
-            supcon_proj_hidden=int(args.supcon_proj_hidden),
-            supcon_proj_bn=int(args.supcon_proj_bn),
-            stn_reg=float(args.stn_reg),
+            supcon_inject=dict(
+                supcon_feat=str(args.supcon_feat),
+                supcon_warp_gt=int(args.supcon_warp_gt),
+                supcon_out=int(args.supcon_out),
+                supcon_min_box=int(args.supcon_min_box),
+                supcon_max_per_class=int(args.supcon_max_per_class),
+                supcon_gain=float(args.supcon_gain),
+                supcon_temp=float(args.supcon_temp),
+                supcon_warmup=int(args.supcon_warmup),
+                supcon_log=int(args.supcon_log),
+                supcon_use_mem=int(args.supcon_use_mem),
+                supcon_queue=int(args.supcon_queue),
+                supcon_loss_weight=(None if args.supcon_loss_weight is None else float(args.supcon_loss_weight)),
+                supcon_neg_iou_ignore=float(args.supcon_neg_iou_ignore),
+                supcon_neg_sameimg_only=int(args.supcon_neg_sameimg_only),
+                supcon_neg_cap=int(args.supcon_neg_cap),
+                supcon_neg_per_pos=float(args.supcon_neg_per_pos),
+                supcon_min_neg_w=float(args.supcon_min_neg_w),
+                supcon_log_n=int(args.supcon_log_n),
+                supcon_proj_dim=int(args.supcon_proj_dim),
+                supcon_proj_hidden=int(args.supcon_proj_hidden),
+                supcon_proj_bn=int(args.supcon_proj_bn),
+                stn_reg=float(args.stn_reg),
 
-        ),
-        supcon_schedule=supcon_schedule_str,         # ví dụ: "3-"
-        supcon_reinforce_keys=[
-            "supcon_feat", "supcon_warp_gt", "supcon_out", "supcon_min_box", "supcon_max_per_class",
-            "supcon_gain", "supcon_temp", "supcon_warmup", "supcon_use_mem", "supcon_queue",
-            "supcon_loss_weight", "supcon_neg_iou_ignore", "supcon_neg_sameimg_only", "supcon_neg_cap",
-            "supcon_neg_per_pos", "supcon_min_neg_w", "supcon_log_n", "supcon_proj_dim", "supcon_proj_hidden",
-            "supcon_proj_bn", "supcon_on",
-        ],
-        supcon_tap=dict(out_idx=int(args.supcon_out)),
-        supcon_proj_attach=supcon_proj_cfg,
-        supcon_percent_logger=bool(int(args.supcon_log)),
+            ),
+            supcon_schedule=supcon_schedule_str,         # ví dụ: "3-"
+            supcon_reinforce_keys=[
+                "supcon_feat", "supcon_warp_gt", "supcon_out", "supcon_min_box", "supcon_max_per_class",
+                "supcon_gain", "supcon_temp", "supcon_warmup", "supcon_use_mem", "supcon_queue",
+                "supcon_loss_weight", "supcon_neg_iou_ignore", "supcon_neg_sameimg_only", "supcon_neg_cap",
+                "supcon_neg_per_pos", "supcon_min_neg_w", "supcon_log_n", "supcon_proj_dim", "supcon_proj_hidden",
+                "supcon_proj_bn", "supcon_on",
+            ],
+            supcon_tap=dict(out_idx=int(args.supcon_out)),
+            supcon_proj_attach=supcon_proj_cfg,
+            supcon_percent_logger=bool(int(args.supcon_log)),
 
-        link_trainer_to_loss=True,
-        sync_epoch_to_loss=True,
-        nan_guard=dict(stop_on_nan=True, save_bad_batch=True),
-        batch_sanity=dict(eps=1e-6),
+            link_trainer_to_loss=True,
+            sync_epoch_to_loss=True,
+            nan_guard=dict(stop_on_nan=True, save_bad_batch=True),
+            batch_sanity=dict(eps=1e-6),
 
-        enable_val_loss=False,
-        val_force_args=None,
-        val_debug_overrides=None,
-        val_trap=False,
+            enable_val_loss=False,
+            val_force_args=None,
+            val_debug_overrides=None,
+            val_trap=False,
 
-        debug_images=dict(epochs={0, 1, 2, 5, 10}, max_images=5),
-        debug_bgpair=dict(epochs={0, 1, 2, 5, 10}, max_pairs=4),
+            debug_images=dict(epochs={0, 1, 2, 5, 10}, max_images=5),
+            debug_bgpair=dict(epochs={0, 1, 2, 5, 10}, max_pairs=4),
 
-        results_csv_guard=True,
-        final_eval_fix=True,
-        save_last_best_only=True,
-    )
-    # --- Bật gói ValTrap + Safety: predict path + NMS + log chi tiết ---
-    register_val_trap_and_safety(
-        yolo,
-        conf=0.01,     # hoặc 0.10 tuỳ bạn muốn mAP nghiêm hay thoáng
-        iou=0.10,      # cho CXR bạn đang dùng 0.10 nên giữ nguyên để so sánh
-        max_det=300,
-        half_if_cuda=True,
-        nms=True,
-        post_loss_k=0,  # 0 = không cần tính val-loss post, tập trung mAP trước
-        log_file=Path(args.output) / "stn_val.log",
-    )
+            results_csv_guard=True,
+            final_eval_fix=True,
+            save_last_best_only=True,
+        )
+        # --- Bật gói ValTrap + Safety: predict path + NMS + log chi tiết ---
+        register_val_trap_and_safety(
+            yolo,
+            conf=0.01,     # hoặc 0.10 tuỳ bạn muốn mAP nghiêm hay thoáng
+            iou=0.10,      # cho CXR bạn đang dùng 0.10 nên giữ nguyên để so sánh
+            max_det=300,
+            half_if_cuda=True,
+            nms=True,
+            post_loss_k=0,  # 0 = không cần tính val-loss post, tập trung mAP trước
+            log_file=Path(args.output) / "stn_val.log",
+        )
 
-    # Pairing
-    if args.pairing:
-        register_pairing(yolo, bgpair_map=args.bgpair_map, batch_size=args.batch)
+        # Pairing
+        if args.pairing:
+            register_pairing(yolo, bgpair_map=args.bgpair_map, batch_size=args.batch)
 
     # 3) Train — ép simplify=False để tránh rủi ro “rụng module” khi final_eval
     yolo.train(
@@ -299,6 +313,8 @@ def train_one(args: argparse.Namespace, run_idx: int) -> None:
         split="val",
         exist_ok=False,
         verbose=True,
+        lr0=args.lr0,
+        lrf=args.lrf,
 
         # để validator có biểu đồ (PR/F1/confusion)
         plots=True,

@@ -141,37 +141,8 @@ def on_export_end(exporter):
     pass
 
 
-default_callbacks = {
-    # Run in trainer
-    "on_pretrain_routine_start": [on_pretrain_routine_start],
-    "on_pretrain_routine_end": [on_pretrain_routine_end],
-    "on_train_start": [on_train_start],
-    "on_train_epoch_start": [on_train_epoch_start],
-    "on_train_batch_start": [on_train_batch_start],
-    "optimizer_step": [optimizer_step],
-    "on_before_zero_grad": [on_before_zero_grad],
-    "on_train_batch_end": [on_train_batch_end],
-    "on_train_epoch_end": [on_train_epoch_end],
-    "on_fit_epoch_end": [on_fit_epoch_end],  # fit = train + val
-    "on_model_save": [on_model_save],
-    "on_train_end": [on_train_end],
-    "on_params_update": [on_params_update],
-    "teardown": [teardown],
-    # Run in validator
-    "on_val_start": [on_val_start],
-    "on_val_batch_start": [on_val_batch_start],
-    "on_val_batch_end": [on_val_batch_end],
-    "on_val_end": [on_val_end],
-    # Run in predictor
-    "on_predict_start": [on_predict_start],
-    "on_predict_batch_start": [on_predict_batch_start],
-    "on_predict_postprocess_end": [on_predict_postprocess_end],
-    "on_predict_batch_end": [on_predict_batch_end],
-    "on_predict_end": [on_predict_end],
-    # Run in exporter
-    "on_export_start": [on_export_start],
-    "on_export_end": [on_export_end],
-}
+# Disable all default callbacks to avoid interfering with console output/progress.
+default_callbacks = {}
 
 
 def get_default_callbacks():
@@ -209,26 +180,5 @@ def add_integration_callbacks(instance):
         >>> trainer = BaseTrainer()
         >>> add_integration_callbacks(trainer)
     """
-    # Load HUB callbacks
-    from .hub import callbacks as hub_cb
-
-    callbacks_list = [hub_cb]
-
-    # Load training callbacks
-    if "Trainer" in instance.__class__.__name__:
-        from .clearml import callbacks as clear_cb
-        from .comet import callbacks as comet_cb
-        from .dvc import callbacks as dvc_cb
-        from .mlflow import callbacks as mlflow_cb
-        from .neptune import callbacks as neptune_cb
-        from .raytune import callbacks as tune_cb
-        from .tensorboard import callbacks as tb_cb
-        from .wb import callbacks as wb_cb
-
-        callbacks_list.extend([clear_cb, comet_cb, dvc_cb, mlflow_cb, neptune_cb, tune_cb, tb_cb, wb_cb])
-
-    # Add the callbacks to the callbacks dictionary
-    for callbacks in callbacks_list:
-        for k, v in callbacks.items():
-            if v not in instance.callbacks[k]:
-                instance.callbacks[k].append(v)
+    # Explicitly no-op to keep callbacks disabled.
+    return

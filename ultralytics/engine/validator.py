@@ -95,15 +95,21 @@ class BaseValidator:
         """Initializes a BaseValidator instance for validation."""
 
         super().__init__()  # Sửa lỗi TypeError
-        self.args = args or get_cfg(DEFAULT_CFG)
+        # NOTE: always convert incoming args (dict/SimpleNamespace) into config namespace
+        # so downstream code can safely use attribute-style access.
+        self.args = get_cfg(DEFAULT_CFG, args or {})
+        # Always disable callbacks to avoid interfering with console progress output.
+        self.disable_callbacks = True
+        # Default to verbose logging unless user explicitly sets quiet=True.
+        self.quiet = getattr(self.args, "quiet", False)
         self.dataloader = dataloader
-        self.save_dir = save_dir
+        self.save_dir = Path(save_dir) if save_dir else None
         self.pbar = pbar
         self.stride = 32
         self.data = None
         self.model = None
         self.metrics = None
-        self.callbacks = callbacks.get_default_callbacks()
+        self.callbacks = {}
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.loss = torch.zeros(3)
         self.skip_loss = False
@@ -140,21 +146,14 @@ class BaseValidator:
 
         infer_model = (trainer.ema.ema or trainer.model).float().eval()
         self.model = trainer.model
-        try:
-            LOGGER.info(
-                f"[ValLoop/setup_from_trainer] model={self.model.__class__.__name__} "
-                f"id={id(self.model)} device={next(self.model.parameters()).device}"
-            )
-        except Exception:
-            pass
-        try:
-            from ultralytics.utils import LOGGER
-            LOGGER.info(
-                f"[ValLoop/setup_from_trainer] model={self.model.__class__.__name__} "
-                f"id={id(self.model)} device={next(self.model.parameters()).device}"
-            )
-        except Exception:
-            pass
+        if not self.quiet:
+            try:
+                LOGGER.info(
+                    f"[ValLoop/setup_from_trainer] model={self.model.__class__.__name__} "
+                    f"id={id(self.model)} device={next(self.model.parameters()).device}"
+                )
+            except Exception:
+                pass
 
         if not self.dataloader:
             self.dataloader = self.get_dataloader(self.data.get(self.args.split), self.args.batch)
@@ -172,7 +171,10 @@ class BaseValidator:
                 fp16=self.args.half,
             )
         if isinstance(model, torch.nn.Module):
-            return model.half() if (self.args.half and self.device.type != "cpu" and hasattr(model, "half")) else model.float()
+            model = model.to(self.device, non_blocking=True)
+            if self.args.half and self.device.type != "cpu" and hasattr(model, "half"):
+                return model.half()
+            return model.float()
         raise TypeError(f"validator: unsupported model type {type(model)}")
 
     @staticmethod
@@ -193,7 +195,8 @@ class BaseValidator:
                 warm(imgsz=(bs, 3, *imsz))
                 return
             except Exception as e:
-                LOGGER.warning(f"Warmup skipped: {e}")
+                if not self.quiet:
+                    LOGGER.warning(f"Warmup skipped: {e}")
         try:
             dev = next(model.parameters()).device
             with torch.no_grad():
@@ -206,8 +209,13 @@ class BaseValidator:
             self.dataloader = self.get_dataloader(self.data.get(self.args.split), self.args.batch)
 
     def _ensure_progress_bar(self):
-        if self.pbar is None:
-            self.pbar = TQDM(self.dataloader, desc=self.pbar_desc, total=len(self.dataloader))
+        total = len(self.dataloader)
+        if self.pbar is not None:
+            try:
+                self.pbar.close()
+            except Exception:
+                pass
+        self.pbar = TQDM(self.dataloader, desc=self.pbar_desc, total=total)
 
     def _attach_names(self, model):
         if isinstance(self.data, dict) and "names" in self.data:
@@ -215,7 +223,8 @@ class BaseValidator:
         elif hasattr(self.model, "names"):
             model.names = self.model.names
         else:
-            LOGGER.warning("Validator could not find 'names'...")
+            if not self.quiet:
+                LOGGER.warning("Validator could not find 'names'...")
             if hasattr(self, "nc") and self.nc:
                 model.names = {i: f"class_{i}" for i in range(self.nc)}
 
@@ -229,11 +238,14 @@ class BaseValidator:
                 torch.cuda.synchronize()
             self.loss += self.model.loss(batch, preds)[1]
         except Exception as e:
-            LOGGER.warning(f"[Validator] skip loss this run: {e}")
+            if not self.quiet:
+                LOGGER.warning(f"[Validator] skip loss this run: {e}")
             self.skip_loss = True
 
     def _log_raw_preds(self, preds):
         """Lightweight debug log of raw predictions before NMS."""
+        if self.quiet:
+            return
         try:
             interval = getattr(self, "val_log_interval", 1)
             if self.batch_i % interval != 0:
@@ -249,7 +261,8 @@ class BaseValidator:
             else:
                 LOGGER.info(f"[Validator DEBUG] (Batch {self.batch_i}) Raw preds type before NMS: {type(preds)}")
         except Exception as e:
-            LOGGER.warning(f"[Validator DEBUG] (Batch {self.batch_i}) Error logging raw preds: {e}")
+            if not self.quiet:
+                LOGGER.warning(f"[Validator DEBUG] (Batch {self.batch_i}) Error logging raw preds: {e}")
     # --- END PATCH ---
 
     @torch.no_grad()
@@ -261,12 +274,12 @@ class BaseValidator:
         """
         self.training = trainer is not None
         augment = self.args.augment and (not self.training)
+        self.disable_callbacks = True
 
         if self.training:
             model = self._setup_from_trainer(trainer)
         else:
-            callbacks.add_integration_callbacks(self)
-            self.run_callbacks("on_val_start")
+            self.callbacks = {}
             assert model is not None, "Either trainer or model is required for validation"
             self.device = select_device(self.args.device, self.args.batch)
             self.args.half &= self.device.type != "cpu"
@@ -274,13 +287,21 @@ class BaseValidator:
             model = self._resolve_model(model)
             self.model = model
             self.model.eval()
-            try:
-                LOGGER.info(
-                    f"[ValLoop/setup_standalone] model={self.model.__class__.__name__} "
-                    f"id={id(self.model)} device={next(self.model.parameters()).device}"
-                )
-            except Exception:
-                pass
+            if self.save_dir is None:
+                self.save_dir = get_save_dir(self.args)
+            else:
+                self.save_dir = Path(self.save_dir)
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            if getattr(self, "metrics", None) is not None:
+                setattr(self.metrics, "save_dir", self.save_dir)
+            if not self.quiet:
+                try:
+                    LOGGER.info(
+                        f"[ValLoop/setup_standalone] model={self.model.__class__.__name__} "
+                        f"id={id(self.model)} device={next(self.model.parameters()).device}"
+                    )
+                except Exception:
+                    pass
 
             self.data = self.get_data()
             if self.device.type == "cpu":
@@ -296,12 +317,13 @@ class BaseValidator:
 
         self.init_metrics(de_parallel(model))
         debug_cap = 0  # disable per-batch debug logs to keep tqdm intact
-        LOGGER.info(f"[ValLoop/start] len_dataloader={len(self.dataloader)} device={self.device}")
+        if not self.quiet:
+            LOGGER.info(f"[ValLoop/start] len_dataloader={len(self.dataloader)} device={self.device}")
         self.jdict = []
         self.val_log_interval = getattr(self, "val_log_interval", 1)
+        self.val_debug_raw = getattr(self.args, "val_debug_raw", False)
 
         for batch_i, batch in enumerate(self.pbar):
-            self.run_callbacks("on_val_batch_start")
             self.batch_i = batch_i
 
             with dt[0]:
@@ -324,7 +346,8 @@ class BaseValidator:
             with dt[2]:
                 self._compute_batch_loss(batch, preds)
 
-            self._log_raw_preds(preds)
+            if self.val_debug_raw:
+                self._log_raw_preds(preds)
 
             with dt[3]:
                 preds = self.postprocess(preds)
@@ -333,8 +356,6 @@ class BaseValidator:
             if self.args.plots and batch_i < 3:
                 self.plot_val_samples(batch, batch_i)
                 self.plot_predictions(batch, preds, batch_i)
-
-            self.run_callbacks("on_val_batch_end")
 
         stats = self.get_stats()
         self.check_stats(stats)
@@ -353,14 +374,15 @@ class BaseValidator:
                 if isinstance(rd, dict):
                     sel = ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)", "fitness", "val/loss"]
                     summary = {k: rd.get(k) for k in sel if k in rd}
-            LOGGER.info(
-                f"[ValLoop/end] stats_len={len(self.stats) if self.stats is not None else 'None'} "
-                f"metrics={summary if summary is not None else 'NA'} speed={self.speed}"
-            )
+            if not self.quiet:
+                LOGGER.info(
+                    f"[ValLoop/end] stats_len={len(self.stats) if self.stats is not None else 'None'} "
+                    f"metrics={summary if summary is not None else 'NA'} speed={self.speed}"
+                )
         except Exception:
             pass
         self.print_results()
-        self.run_callbacks("on_val_end")
+        # callbacks are disabled
         if self.training and trainer is not None:
             try:
                 trainer.metrics = dict(self.metrics) if isinstance(self.metrics, dict) else self.metrics
@@ -425,13 +447,12 @@ class BaseValidator:
         return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
 
     def add_callback(self, event: str, callback):
-        """Append the given callback to the specified event."""
-        self.callbacks[event].append(callback)
+        """Callbacks are disabled; no-op."""
+        return
 
     def run_callbacks(self, event: str):
-        """Run all callbacks associated with a specified event."""
-        for callback in self.callbacks.get(event, []):
-            callback(self)
+        """Callbacks are disabled; no-op."""
+        return
 
     def get_dataloader(self, dataset_path, batch_size):
         """Get data loader from dataset path and batch size."""

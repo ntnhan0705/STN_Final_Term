@@ -532,16 +532,8 @@ class BaseTrainer:
 
             # cho loss đọc trainer handle (chỉ supcon_*)
             try:
-                prev = getattr(crit, "_trainer", None)
-                if isinstance(prev, SimpleNamespace):
-                    prev.args = merged
-                    if not hasattr(prev, "epoch"):
-                        prev.epoch = getattr(trainer, "epoch", 0)
-                    if not hasattr(prev, "trainer"):
-                        prev.trainer = trainer
-                    crit._trainer = prev
-                else:
-                    crit._trainer = SimpleNamespace(args=merged, epoch=getattr(trainer, "epoch", 0), trainer=trainer)
+                # ensure loss keeps reference to real trainer for epoch/loader/state access
+                crit._trainer = trainer
             except Exception:
                 pass
 
@@ -721,7 +713,8 @@ class BaseTrainer:
             # Apply mosaic closure at specified epoch
             if epoch == (self.epochs - self.args.close_mosaic):
                 self._close_dataloader_mosaic()
-                self.train_loader.reset()
+                if hasattr(self.train_loader, "reset") and callable(self.train_loader.reset):
+                    self.train_loader.reset()
 
             # Initialize progress bar for this epoch
             batch_iter = enumerate(self.train_loader)
@@ -903,9 +896,6 @@ class BaseTrainer:
                     f"Epoch {epoch + 1}/{self.epochs} - " +
                     ", ".join(f"{name}={val:.4f}" for name, val in zip(self.loss_names, loss_values))
                 )
-
-                # Early stop
-                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
 
                 # Check for early stopping
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
